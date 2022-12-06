@@ -164,7 +164,7 @@ function locationUpdateCallback(
     // output a warning and don't overwrite it.
     if (!existingFingerprint) {
       result.partialFingerprints.primaryLocationLineHash = hashValue;
-    } else if (existingFingerprint !== hashValue) {
+    } else if (false && existingFingerprint !== hashValue) {
       logger.warning(
         `Calculated fingerprint of ${hashValue} for file ${location.physicalLocation.artifactLocation.uri} line ${lineNumber}, but found existing inconsistent fingerprint value ${existingFingerprint}`
       );
