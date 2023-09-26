@@ -1,27 +1,28 @@
 import * as core from "@actions/core";
 
 import {
-  createStatusReportBase,
-  getActionsStatus,
+  getActionVersion,
   getOptionalInput,
   getTemporaryDirectory,
-  sendStatusReport,
-  StatusReportBase,
 } from "./actions-util";
 import { getGitHubVersion } from "./api-client";
 import { determineAutobuildLanguages, runAutobuild } from "./autobuild";
 import * as configUtils from "./config-utils";
+import { EnvVar } from "./environment";
 import { Language } from "./languages";
-import { getActionsLogger } from "./logging";
+import { Logger, getActionsLogger } from "./logging";
 import {
-  DID_AUTOBUILD_GO_ENV_VAR_NAME,
-  checkActionVersion,
+  StatusReportBase,
+  getActionsStatus,
+  createStatusReportBase,
+  sendStatusReport,
+} from "./status-report";
+import {
+  checkDiskUsage,
   checkGitHubVersionInRange,
   initializeEnvironment,
+  wrapError,
 } from "./util";
-
-// eslint-disable-next-line import/no-commonjs
-const pkg = require("../package.json");
 
 interface AutobuildStatusReport extends StatusReportBase {
   /** Comma-separated set of languages being auto-built. */
@@ -31,20 +32,22 @@ interface AutobuildStatusReport extends StatusReportBase {
 }
 
 async function sendCompletedStatusReport(
+  logger: Logger,
   startedAt: Date,
   allLanguages: string[],
   failingLanguage?: string,
-  cause?: Error
+  cause?: Error,
 ) {
-  initializeEnvironment(pkg.version);
+  initializeEnvironment(getActionVersion());
 
   const status = getActionsStatus(cause, failingLanguage);
   const statusReportBase = await createStatusReportBase(
     "autobuild",
     status,
     startedAt,
+    await checkDiskUsage(logger),
     cause?.message,
-    cause?.stack
+    cause?.stack,
   );
   const statusReport: AutobuildStatusReport = {
     ...statusReportBase,
@@ -57,13 +60,17 @@ async function sendCompletedStatusReport(
 async function run() {
   const startedAt = new Date();
   const logger = getActionsLogger();
-  await checkActionVersion(pkg.version);
   let currentLanguage: Language | undefined = undefined;
   let languages: Language[] | undefined = undefined;
   try {
     if (
       !(await sendStatusReport(
-        await createStatusReportBase("autobuild", "starting", startedAt)
+        await createStatusReportBase(
+          "autobuild",
+          "starting",
+          startedAt,
+          await checkDiskUsage(logger),
+        ),
       ))
     ) {
       return;
@@ -75,7 +82,7 @@ async function run() {
     const config = await configUtils.getConfig(getTemporaryDirectory(), logger);
     if (config === undefined) {
       throw new Error(
-        "Config file could not be found at expected location. Has the 'init' action been called?"
+        "Config file could not be found at expected location. Has the 'init' action been called?",
       );
     }
 
@@ -84,7 +91,7 @@ async function run() {
       const workingDirectory = getOptionalInput("working-directory");
       if (workingDirectory) {
         logger.info(
-          `Changing autobuilder working directory to ${workingDirectory}`
+          `Changing autobuilder working directory to ${workingDirectory}`,
         );
         process.chdir(workingDirectory);
       }
@@ -92,35 +99,33 @@ async function run() {
         currentLanguage = language;
         await runAutobuild(language, config, logger);
         if (language === Language.go) {
-          core.exportVariable(DID_AUTOBUILD_GO_ENV_VAR_NAME, "true");
+          core.exportVariable(EnvVar.DID_AUTOBUILD_GOLANG, "true");
         }
       }
     }
-  } catch (error) {
+  } catch (unwrappedError) {
+    const error = wrapError(unwrappedError);
     core.setFailed(
-      `We were unable to automatically build your code. Please replace the call to the autobuild action with your custom build steps.  ${
-        error instanceof Error ? error.message : String(error)
-      }`
+      `We were unable to automatically build your code. Please replace the call to the autobuild action with your custom build steps. ${error.message}`,
     );
-    console.log(error);
     await sendCompletedStatusReport(
+      logger,
       startedAt,
       languages ?? [],
       currentLanguage,
-      error instanceof Error ? error : new Error(String(error))
+      error,
     );
     return;
   }
 
-  await sendCompletedStatusReport(startedAt, languages ?? []);
+  await sendCompletedStatusReport(logger, startedAt, languages ?? []);
 }
 
 async function runWrapper() {
   try {
     await run();
   } catch (error) {
-    core.setFailed(`autobuild action failed. ${error}`);
-    console.log(error);
+    core.setFailed(`autobuild action failed. ${wrapError(error).message}`);
   }
 }
 

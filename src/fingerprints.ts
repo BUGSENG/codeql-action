@@ -41,12 +41,12 @@ type hashCallback = (lineNumber: number, hash: string) => void;
  */
 export async function hash(callback: hashCallback, filepath: string) {
   // A rolling view in to the input
-  const window = Array(BLOCK_SIZE).fill(0);
+  const window: number[] = Array(BLOCK_SIZE).fill(0);
 
   // If the character in the window is the start of a new line
   // then records the line number, otherwise will be -1.
   // Indexes match up with those from the window variable.
-  const lineNumbers = Array(BLOCK_SIZE).fill(-1);
+  const lineNumbers: number[] = Array(BLOCK_SIZE).fill(-1);
 
   // The current hash value, updated as we read each character
   let hashRaw = Long.ZERO;
@@ -120,7 +120,7 @@ export async function hash(callback: hashCallback, filepath: string) {
   const readStream = fs.createReadStream(filepath, "utf8");
   for await (const data of readStream) {
     for (let i = 0; i < data.length; ++i) {
-      processCharacter(data.charCodeAt(i));
+      processCharacter((data as string).charCodeAt(i));
     }
   }
   processCharacter(EOF);
@@ -139,7 +139,7 @@ export async function hash(callback: hashCallback, filepath: string) {
 function locationUpdateCallback(
   result: SarifResult,
   location: any,
-  logger: Logger
+  logger: Logger,
 ): hashCallback {
   let locationStartLine = location.physicalLocation?.region?.startLine;
   if (locationStartLine === undefined) {
@@ -166,7 +166,7 @@ function locationUpdateCallback(
       result.partialFingerprints.primaryLocationLineHash = hashValue;
     } else if (false && existingFingerprint !== hashValue) {
       logger.warning(
-        `Calculated fingerprint of ${hashValue} for file ${location.physicalLocation.artifactLocation.uri} line ${lineNumber}, but found existing inconsistent fingerprint value ${existingFingerprint}`
+        `Calculated fingerprint of ${hashValue} for file ${location.physicalLocation.artifactLocation.uri} line ${lineNumber}, but found existing inconsistent fingerprint value ${existingFingerprint}`,
       );
     }
   };
@@ -180,7 +180,7 @@ export function resolveUriToFile(
   location: any,
   artifacts: any[],
   sourceRoot: string,
-  logger: Logger
+  logger: Logger,
 ): string | undefined {
   // This may be referencing an artifact
   if (!location.uri && location.index !== undefined) {
@@ -201,7 +201,14 @@ export function resolveUriToFile(
     logger.debug(`Ignoring location as URI "${location.uri}" is invalid`);
     return undefined;
   }
-  let uri = decodeURIComponent(location.uri);
+
+  let uri: string;
+  try {
+    uri = decodeURIComponent(location.uri as string);
+  } catch (e: any) {
+    logger.debug(`Ignoring location as URI "${location.uri}" is invalid`);
+    return undefined;
+  }
 
   // Remove a file scheme, and abort if the scheme is anything else
   const fileUriPrefix = "file://";
@@ -210,7 +217,7 @@ export function resolveUriToFile(
   }
   if (uri.indexOf("://") !== -1) {
     logger.debug(
-      `Ignoring location URI "${uri}" as the scheme is not recognised`
+      `Ignoring location URI "${uri}" as the scheme is not recognised`,
     );
     return undefined;
   }
@@ -219,7 +226,7 @@ export function resolveUriToFile(
   const srcRootPrefix = `${sourceRoot}/`;
   if (uri.startsWith("/") && !uri.startsWith(srcRootPrefix)) {
     logger.debug(
-      `Ignoring location URI "${uri}" as it is outside of the src root`
+      `Ignoring location URI "${uri}" as it is outside of the src root`,
     );
     return undefined;
   }
@@ -250,7 +257,7 @@ export function resolveUriToFile(
 export async function addFingerprints(
   sarif: SarifFile,
   sourceRoot: string,
-  logger: Logger
+  logger: Logger,
 ): Promise<SarifFile> {
   // Gather together results for the same file and construct
   // callbacks to accept hashes for that file and update the location
@@ -265,8 +272,8 @@ export async function addFingerprints(
       if (!primaryLocation?.physicalLocation?.artifactLocation) {
         logger.debug(
           `Unable to compute fingerprint for invalid location: ${JSON.stringify(
-            primaryLocation
-          )}`
+            primaryLocation,
+          )}`,
         );
         continue;
       }
@@ -280,7 +287,7 @@ export async function addFingerprints(
         primaryLocation.physicalLocation.artifactLocation,
         artifacts,
         sourceRoot,
-        logger
+        logger,
       );
       if (!filepath) {
         continue;
@@ -289,7 +296,7 @@ export async function addFingerprints(
         callbacksByFile[filepath] = [];
       }
       callbacksByFile[filepath].push(
-        locationUpdateCallback(result, primaryLocation, logger)
+        locationUpdateCallback(result, primaryLocation, logger),
       );
     }
   }

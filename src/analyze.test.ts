@@ -3,25 +3,33 @@ import * as path from "path";
 
 import test, { ExecutionContext } from "ava";
 import * as yaml from "js-yaml";
+import * as sinon from "sinon";
 
 import {
   convertPackToQuerySuiteEntry,
   createQuerySuiteContents,
   runQueries,
   validateQueryFilters,
+  QueriesStatusReport,
 } from "./analyze";
-import { setCodeQL } from "./codeql";
-import { Config } from "./config-utils";
+import { CodeQL, setCodeQL } from "./codeql";
+import { Config, QueriesWithSearchPath } from "./config-utils";
+import { Feature } from "./feature-flags";
 import { Language } from "./languages";
 import { getRunnerLogger } from "./logging";
 import { setupTests, setupActionsVars, createFeatures } from "./testing-utils";
+import * as uploadLib from "./upload-lib";
 import * as util from "./util";
 
 setupTests(test);
 
-// Checks that the duration fields are populated for the correct language
-// and correct case of builtin or custom. Also checks the correct search
-// paths are set in the database analyze invocation.
+/** Checks that the duration fields are populated for the correct language
+ * and correct case of builtin or custom. Also checks the correct search
+ * paths are set in the database analyze invocation.
+ *
+ * Mocks the QA telemetry feature flag and checks the appropriate status report
+ * fields.
+ */
 test("status report fields and search path setting", async (t) => {
   let searchPathsUsed: Array<string | undefined> = [];
   return await util.withTmpDir(async (tmpDir) => {
@@ -35,19 +43,21 @@ test("status report fields and search path setting", async (t) => {
       [Language.java]: ["c/d@2.0.0"],
     };
 
+    sinon.stub(uploadLib, "validateSarifFileSchema");
+
     for (const language of Object.values(Language)) {
       setCodeQL({
         packDownload: async () => ({ packs: [] }),
         databaseRunQueries: async (
           _db: string,
-          searchPath: string | undefined
+          searchPath: string | undefined,
         ) => {
           searchPathsUsed.push(searchPath);
         },
         databaseInterpretResults: async (
           _db: string,
           _queriesRun: string[],
-          sarifFile: string
+          sarifFile: string,
         ) => {
           fs.writeFileSync(
             sarifFile,
@@ -84,7 +94,7 @@ test("status report fields and search path setting", async (t) => {
                 },
                 {},
               ],
-            })
+            }),
           );
           return "";
         },
@@ -132,33 +142,42 @@ test("status report fields and search path setting", async (t) => {
         undefined,
         config,
         getRunnerLogger(true),
-        createFeatures([])
+        createFeatures([Feature.QaTelemetryEnabled]),
       );
       const hasPacks = language in packs;
       const statusReportKeys = Object.keys(builtinStatusReport).sort();
       if (hasPacks) {
-        t.deepEqual(statusReportKeys.length, 3, statusReportKeys.toString());
+        t.deepEqual(statusReportKeys.length, 4, statusReportKeys.toString());
         t.deepEqual(
           statusReportKeys[0],
-          `analyze_builtin_queries_${language}_duration_ms`
+          `analyze_builtin_queries_${language}_duration_ms`,
         );
         t.deepEqual(
           statusReportKeys[1],
-          `analyze_custom_queries_${language}_duration_ms`
+          `analyze_custom_queries_${language}_duration_ms`,
         );
+        t.deepEqual(statusReportKeys[2], "event_reports");
         t.deepEqual(
-          statusReportKeys[2],
-          `interpret_results_${language}_duration_ms`
+          statusReportKeys[3],
+          `interpret_results_${language}_duration_ms`,
         );
       } else {
         t.deepEqual(
           statusReportKeys[0],
-          `analyze_builtin_queries_${language}_duration_ms`
+          `analyze_builtin_queries_${language}_duration_ms`,
         );
+        t.deepEqual(statusReportKeys[1], "event_reports");
         t.deepEqual(
-          statusReportKeys[1],
-          `interpret_results_${language}_duration_ms`
+          statusReportKeys[2],
+          `interpret_results_${language}_duration_ms`,
         );
+      }
+      if (builtinStatusReport.event_reports) {
+        for (const eventReport of builtinStatusReport.event_reports) {
+          t.deepEqual(eventReport.event, "codeql database interpret-results");
+          t.true("properties" in eventReport);
+          t.true("alertCounts" in eventReport.properties!);
+        }
       }
 
       config.queries[language] = {
@@ -182,17 +201,25 @@ test("status report fields and search path setting", async (t) => {
         undefined,
         config,
         getRunnerLogger(true),
-        createFeatures([])
+        createFeatures([Feature.QaTelemetryEnabled]),
       );
-      t.deepEqual(Object.keys(customStatusReport).length, 2);
+      t.deepEqual(Object.keys(customStatusReport).length, 3);
       t.true(
-        `analyze_custom_queries_${language}_duration_ms` in customStatusReport
+        `analyze_custom_queries_${language}_duration_ms` in customStatusReport,
       );
       const expectedSearchPathsUsed = hasPacks
         ? [undefined, undefined, "/1", "/2", undefined]
         : [undefined, "/1", "/2"];
       t.deepEqual(searchPathsUsed, expectedSearchPathsUsed);
       t.true(`interpret_results_${language}_duration_ms` in customStatusReport);
+      t.true("event_reports" in customStatusReport);
+      if (customStatusReport.event_reports) {
+        for (const eventReport of customStatusReport.event_reports) {
+          t.deepEqual(eventReport.event, "codeql database interpret-results");
+          t.true("properties" in eventReport);
+          t.true("alertCounts" in eventReport.properties!);
+        }
+      }
     }
 
     verifyQuerySuites(tmpDir);
@@ -218,15 +245,184 @@ test("status report fields and search path setting", async (t) => {
     function readContents(name: string) {
       const x = fs.readFileSync(
         path.join(tmpDir, "codeql_databases", name),
-        "utf8"
+        "utf8",
       );
       console.log(x);
 
       return yaml.load(
-        fs.readFileSync(path.join(tmpDir, "codeql_databases", name), "utf8")
+        fs.readFileSync(path.join(tmpDir, "codeql_databases", name), "utf8"),
       );
     }
   }
+});
+
+function mockCodeQL(): Partial<CodeQL> {
+  return {
+    getVersion: async () => "2.12.2",
+    databaseRunQueries: sinon.spy(),
+    databaseInterpretResults: async () => "",
+    databasePrintBaseline: async () => "",
+  };
+}
+
+function createBaseConfig(tmpDir: string): Config {
+  return {
+    languages: [],
+    queries: {},
+    pathsIgnore: [],
+    paths: [],
+    originalUserInput: {},
+    tempDir: "tempDir",
+    codeQLCmd: "",
+    gitHubVersion: {
+      type: util.GitHubVariant.DOTCOM,
+    } as util.GitHubVersion,
+    dbLocation: path.resolve(tmpDir, "codeql_databases"),
+    packs: {},
+    debugMode: false,
+    debugArtifactName: util.DEFAULT_DEBUG_ARTIFACT_NAME,
+    debugDatabaseName: util.DEFAULT_DEBUG_DATABASE_NAME,
+    augmentationProperties: {
+      injectedMlQueries: false,
+      packsInputCombines: false,
+      queriesInputCombines: false,
+    },
+    trapCaches: {},
+    trapCacheDownloadTime: 0,
+  };
+}
+
+function createQueryConfig(
+  builtin: string[],
+  custom: string[],
+): { builtin: string[]; custom: QueriesWithSearchPath[] } {
+  return {
+    builtin,
+    custom: custom.map((c) => ({ searchPath: "/search", queries: [c] })),
+  };
+}
+
+async function runQueriesWithConfig(
+  config: Config,
+  features: Feature[],
+): Promise<QueriesStatusReport> {
+  for (const language of config.languages) {
+    fs.mkdirSync(util.getCodeQLDatabasePath(config, language), {
+      recursive: true,
+    });
+  }
+  return runQueries(
+    "sarif-folder",
+    "--memFlag",
+    "--addSnippetsFlag",
+    "--threadsFlag",
+    undefined,
+    config,
+    getRunnerLogger(true),
+    createFeatures(features),
+  );
+}
+
+function getDatabaseRunQueriesCalls(mock: Partial<CodeQL>) {
+  return (mock.databaseRunQueries as sinon.SinonSpy).getCalls();
+}
+
+test("optimizeForLastQueryRun for one language", async (t) => {
+  return await util.withTmpDir(async (tmpDir) => {
+    const codeql = mockCodeQL();
+    setCodeQL(codeql);
+    const config: Config = createBaseConfig(tmpDir);
+    config.languages = [Language.cpp];
+    config.queries.cpp = createQueryConfig(["foo.ql"], []);
+
+    await runQueriesWithConfig(config, []);
+    t.deepEqual(
+      getDatabaseRunQueriesCalls(codeql).map((c) => c.args[4]),
+      [true],
+    );
+  });
+});
+
+test("optimizeForLastQueryRun for two languages", async (t) => {
+  return await util.withTmpDir(async (tmpDir) => {
+    const codeql = mockCodeQL();
+    setCodeQL(codeql);
+    const config: Config = createBaseConfig(tmpDir);
+    config.languages = [Language.cpp, Language.java];
+    config.queries.cpp = createQueryConfig(["foo.ql"], []);
+    config.queries.java = createQueryConfig(["bar.ql"], []);
+
+    await runQueriesWithConfig(config, []);
+    t.deepEqual(
+      getDatabaseRunQueriesCalls(codeql).map((c) => c.args[4]),
+      [true, true],
+    );
+  });
+});
+
+test("optimizeForLastQueryRun for two languages, with custom queries", async (t) => {
+  return await util.withTmpDir(async (tmpDir) => {
+    const codeql = mockCodeQL();
+    setCodeQL(codeql);
+    const config: Config = createBaseConfig(tmpDir);
+    config.languages = [Language.cpp, Language.java];
+    config.queries.cpp = createQueryConfig(["foo.ql"], ["c1.ql", "c2.ql"]);
+    config.queries.java = createQueryConfig(["bar.ql"], ["c3.ql"]);
+
+    await runQueriesWithConfig(config, []);
+    t.deepEqual(
+      getDatabaseRunQueriesCalls(codeql).map((c) => c.args[4]),
+      [false, false, true, false, true],
+    );
+  });
+});
+
+test("optimizeForLastQueryRun for two languages, with custom queries and packs", async (t) => {
+  return await util.withTmpDir(async (tmpDir) => {
+    const codeql = mockCodeQL();
+    setCodeQL(codeql);
+    const config: Config = createBaseConfig(tmpDir);
+    config.languages = [Language.cpp, Language.java];
+    config.queries.cpp = createQueryConfig(["foo.ql"], ["c1.ql", "c2.ql"]);
+    config.queries.java = createQueryConfig(["bar.ql"], ["c3.ql"]);
+    config.packs.cpp = ["a/cpp-pack1@0.1.0"];
+    config.packs.java = ["b/java-pack1@0.2.0", "b/java-pack2@0.3.3"];
+    await runQueriesWithConfig(config, []);
+    t.deepEqual(
+      getDatabaseRunQueriesCalls(codeql).map((c) => c.args[4]),
+      [false, false, false, true, false, false, true],
+    );
+  });
+});
+
+test("optimizeForLastQueryRun for one language, CliConfigFileEnabled", async (t) => {
+  return await util.withTmpDir(async (tmpDir) => {
+    const codeql = mockCodeQL();
+    setCodeQL(codeql);
+    const config: Config = createBaseConfig(tmpDir);
+    config.languages = [Language.cpp];
+
+    await runQueriesWithConfig(config, [Feature.CliConfigFileEnabled]);
+    t.deepEqual(
+      getDatabaseRunQueriesCalls(codeql).map((c) => c.args[4]),
+      [true],
+    );
+  });
+});
+
+test("optimizeForLastQueryRun for two languages, CliConfigFileEnabled", async (t) => {
+  return await util.withTmpDir(async (tmpDir) => {
+    const codeql = mockCodeQL();
+    setCodeQL(codeql);
+    const config: Config = createBaseConfig(tmpDir);
+    config.languages = [Language.cpp, Language.java];
+
+    await runQueriesWithConfig(config, [Feature.CliConfigFileEnabled]);
+    t.deepEqual(
+      getDatabaseRunQueriesCalls(codeql).map((c) => c.args[4]),
+      [true, true],
+    );
+  });
 });
 
 test("validateQueryFilters", (t) => {
@@ -270,24 +466,25 @@ test("validateQueryFilters", (t) => {
         },
       ]);
     },
-    { message: /Query filter must have exactly one key/ }
+    { message: /Query filter must have exactly one key/ },
   );
 
   t.throws(
     () => {
       return validateQueryFilters([{ xxx: "foo" } as any]);
     },
-    { message: /Only "include" or "exclude" filters are allowed/ }
+    { message: /Only "include" or "exclude" filters are allowed/ },
   );
 
   t.throws(
     () => {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
       return validateQueryFilters({ exclude: "foo" } as any);
     },
     {
       message:
         /Query filters must be an array of "include" or "exclude" entries/,
-    }
+    },
   );
 });
 
@@ -384,7 +581,7 @@ test("createQuerySuiteContents", (t) => {
       {
         include: { "problem.severity": "recommendation" },
       },
-    ]
+    ],
   );
   const expected = `- query: query1.ql
 - query: query2.ql

@@ -1,6 +1,6 @@
 name: "Packaging: Config file"
 description: "Checks that specifying packages using only a config file works"
-versions: ["latest", "cached", "nightly-latest"] # This feature is not compatible with old CLIs
+versions: ["latest", "default", "nightly-latest"] # This feature is not compatible with old CLIs
 steps:
   - uses: ./../action/init
     with:
@@ -13,9 +13,10 @@ steps:
   - uses: ./../action/analyze
     with:
       output: "${{ runner.temp }}/results"
+      upload-database: false
 
   - name: Check results
-    uses: ./../action/.github/check-sarif
+    uses: ./../action/.github/actions/check-sarif
     with:
       sarif-file: ${{ runner.temp }}/results/javascript.sarif
       queries-run: javascript/example/empty-or-one-block,javascript/example/empty-or-one-block,javascript/example/other-query-block,javascript/example/two-block

@@ -3,7 +3,9 @@ import * as sinon from "sinon";
 
 import * as actionsUtil from "./actions-util";
 import * as analyze from "./analyze";
+import * as api from "./api-client";
 import * as configUtils from "./config-utils";
+import * as statusReport from "./status-report";
 import {
   setupTests,
   setupActionsVars,
@@ -26,9 +28,9 @@ test("analyze action with RAM & threads from action inputs", async (t) => {
     process.env["GITHUB_REPOSITORY"] = "github/codeql-action-fake-repository";
     process.env["GITHUB_API_URL"] = "https://api.github.com";
     sinon
-      .stub(actionsUtil, "createStatusReportBase")
-      .resolves({} as actionsUtil.StatusReportBase);
-    sinon.stub(actionsUtil, "sendStatusReport").resolves(true);
+      .stub(statusReport, "createStatusReportBase")
+      .resolves({} as statusReport.StatusReportBase);
+    sinon.stub(statusReport, "sendStatusReport").resolves(true);
     const gitHubVersion: util.GitHubVersion = {
       type: util.GitHubVariant.DOTCOM,
     };
@@ -44,7 +46,7 @@ test("analyze action with RAM & threads from action inputs", async (t) => {
     const optionalInputStub = sinon.stub(actionsUtil, "getOptionalInput");
     optionalInputStub.withArgs("cleanup-level").returns("none");
     optionalInputStub.withArgs("expect-error").returns("false");
-    sinon.stub(util, "getGitHubVersion").resolves(gitHubVersion);
+    sinon.stub(api, "getGitHubVersion").resolves(gitHubVersion);
     sinon.stub(actionsUtil, "isAnalyzingDefaultBranch").resolves(true);
     setupActionsVars(tmpDir, tmpDir);
     mockFeatureFlagApiEndpoint(200, {});

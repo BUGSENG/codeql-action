@@ -2,18 +2,16 @@ name: "Export file baseline information"
 description: "Tests that file baseline information is exported when the feature is enabled"
 versions: ["nightly-latest"]
 steps:
-  - uses: swift-actions/setup-swift@5cdaa9161ad1f55ae39a5ea1784ef96de72f95d9
-    # Windows doesn't support Swift, and only macOS latest and nightly-latest support Swift 5.7.1.
-    if: runner.os == 'Linux' || (runner.os == 'macOS' && matrix.version == 'cached')
-    with:
-      swift-version: "5.7"
   - uses: ./../action/init
+    id: init
     with:
       languages: javascript
       tools: ${{ steps.prepare-test.outputs.tools-url }}
     env:
       CODEQL_FILE_BASELINE_INFORMATION: true
-      CODEQL_ENABLE_EXPERIMENTAL_FEATURES_SWIFT: true
+  - uses: ./../action/.github/actions/setup-swift
+    with:
+      codeql-path: ${{ steps.init.outputs.codeql-path }}
   - name: Build code
     shell: bash
     run: ./build.sh
@@ -22,7 +20,6 @@ steps:
       output: "${{ runner.temp }}/results"
     env:
       CODEQL_FILE_BASELINE_INFORMATION: true
-      CODEQL_ENABLE_EXPERIMENTAL_FEATURES_SWIFT: true
   - name: Upload SARIF
     uses: actions/upload-artifact@v3
     with:
@@ -33,7 +30,10 @@ steps:
     shell: bash
     run: |
       cd "$RUNNER_TEMP/results"
-      expected_baseline_languages="cpp cs go java js py rb swift"
+      expected_baseline_languages="cpp cs go java js py rb"
+      if [[ $RUNNER_OS != "Windows" ]]; then
+        expected_baseline_languages+=" swift"
+      fi
 
       for lang in ${expected_baseline_languages}; do
         rule_name="${lang}/baseline/expected-extracted-files"

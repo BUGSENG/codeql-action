@@ -4,26 +4,17 @@ import * as path from "path";
 import { promisify } from "util";
 
 import * as core from "@actions/core";
+import checkDiskSpace from "check-disk-space";
 import del from "del";
 import getFolderSize from "get-folder-size";
 import * as semver from "semver";
 
-import * as api from "./api-client";
-import { getApiClient, GitHubApiDetails } from "./api-client";
 import * as apiCompatibility from "./api-compatibility.json";
-import { CodeQL, CODEQL_VERSION_NEW_TRACING } from "./codeql";
-import {
-  Config,
-  getLanguagesInRepo,
-  getRawLanguages,
-  parsePacksSpecification,
-  prettyPrintPack,
-} from "./config-utils";
-import { Feature, FeatureEnablement } from "./feature-flags";
-import { KOTLIN_SWIFT_BYPASS, Language } from "./languages";
+import type { CodeQL } from "./codeql";
+import type { Config, Pack } from "./config-utils";
+import { EnvVar } from "./environment";
+import { Language } from "./languages";
 import { Logger } from "./logging";
-import { RepositoryNwo } from "./repository";
-import { CODEQL_ACTION_TEST_MODE } from "./shared-environment";
 
 /**
  * Specifies bundle versions that are known to be broken
@@ -47,11 +38,15 @@ export const DEFAULT_DEBUG_ARTIFACT_NAME = "debug-artifacts";
 export const DEFAULT_DEBUG_DATABASE_NAME = "db";
 
 /**
- * Environment variable that is set to "true" when the CodeQL Action has invoked
- * the Go autobuilder.
+ * The default fraction of the total RAM above 8 GB that should be reserved for the system.
  */
-export const DID_AUTOBUILD_GO_ENV_VAR_NAME =
-  "CODEQL_ACTION_DID_AUTOBUILD_GOLANG";
+const DEFAULT_RESERVED_RAM_SCALING_FACTOR = 0.05;
+
+/**
+ * The minimum amount of memory imposed by a cgroup limit that we will consider. Memory limits below
+ * this amount are ignored.
+ */
+const MINIMUM_CGROUP_MEMORY_LIMIT_BYTES = 1024 * 1024;
 
 export interface SarifFile {
   version?: string | null;
@@ -69,11 +64,19 @@ export interface SarifRun {
     id?: string;
   };
   artifacts?: string[];
+  invocations?: SarifInvocation[];
   results?: SarifResult[];
+}
+
+export interface SarifInvocation {
+  toolExecutionNotifications?: SarifNotification[];
 }
 
 export interface SarifResult {
   ruleId?: string;
+  rule?: {
+    id?: string;
+  };
   message?: {
     text?: string;
   };
@@ -92,6 +95,18 @@ export interface SarifResult {
   };
 }
 
+export interface SarifNotification {
+  locations?: SarifLocation[];
+}
+
+export interface SarifLocation {
+  physicalLocation?: {
+    artifactLocation?: {
+      uri?: string;
+    };
+  };
+}
+
 /**
  * Get the extra options for the codeql commands.
  */
@@ -103,10 +118,10 @@ export function getExtraOptionsEnvParam(): object {
   }
   try {
     return JSON.parse(raw);
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
+  } catch (unwrappedError) {
+    const error = wrapError(unwrappedError);
     throw new Error(
-      `${varName} environment variable is set, but does not contain valid JSON: ${message}`
+      `${varName} environment variable is set, but does not contain valid JSON: ${error.message}`,
     );
   }
 }
@@ -133,7 +148,7 @@ export function getToolNames(sarif: SarifFile): string[] {
 // Creates a random temporary directory, runs the given body, and then deletes the directory.
 // Mostly intended for use within tests.
 export async function withTmpDir<T>(
-  body: (tmpDir: string) => Promise<T>
+  body: (tmpDir: string) => Promise<T>,
 ): Promise<T> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codeql-action-"));
   const result = await body(tmpDir);
@@ -148,9 +163,29 @@ export async function withTmpDir<T>(
  * from committing too much of the available memory to CodeQL.
  * @returns number
  */
-function getSystemReservedMemoryMegaBytes(): number {
+function getSystemReservedMemoryMegaBytes(
+  totalMemoryMegaBytes: number,
+  platform: string,
+): number {
   // Windows needs more memory for OS processes.
-  return 1024 * (process.platform === "win32" ? 1.5 : 1);
+  const fixedAmount = 1024 * (platform === "win32" ? 1.5 : 1);
+
+  // Reserve an additional percentage of the amount of memory above 8 GB, since the amount used by
+  // the kernel for page tables scales with the size of physical memory.
+  const scaledAmount =
+    getReservedRamScaleFactor() * Math.max(totalMemoryMegaBytes - 8 * 1024, 0);
+  return fixedAmount + scaledAmount;
+}
+
+function getReservedRamScaleFactor(): number {
+  const envVar = Number.parseInt(
+    process.env[EnvVar.SCALING_RESERVED_RAM_PERCENTAGE] || "",
+    10,
+  );
+  if (envVar < 0 || envVar > 100 || Number.isNaN(envVar)) {
+    return DEFAULT_RESERVED_RAM_SCALING_FACTOR;
+  }
+  return envVar / 100;
 }
 
 /**
@@ -160,7 +195,11 @@ function getSystemReservedMemoryMegaBytes(): number {
  *
  * @returns {number} the amount of RAM to use, in megabytes
  */
-export function getMemoryFlagValue(userInput: string | undefined): number {
+export function getMemoryFlagValueForPlatform(
+  userInput: string | undefined,
+  totalMemoryBytes: number,
+  platform: string,
+): number {
   let memoryToUseMegaBytes: number;
   if (userInput) {
     memoryToUseMegaBytes = Number(userInput);
@@ -168,12 +207,99 @@ export function getMemoryFlagValue(userInput: string | undefined): number {
       throw new Error(`Invalid RAM setting "${userInput}", specified.`);
     }
   } else {
-    const totalMemoryBytes = os.totalmem();
     const totalMemoryMegaBytes = totalMemoryBytes / (1024 * 1024);
-    const reservedMemoryMegaBytes = getSystemReservedMemoryMegaBytes();
+    const reservedMemoryMegaBytes = getSystemReservedMemoryMegaBytes(
+      totalMemoryMegaBytes,
+      platform,
+    );
     memoryToUseMegaBytes = totalMemoryMegaBytes - reservedMemoryMegaBytes;
   }
   return Math.floor(memoryToUseMegaBytes);
+}
+
+/**
+ * Get the total amount of memory available to the Action, taking into account constraints imposed
+ * by cgroups on Linux.
+ */
+function getTotalMemoryBytes(logger: Logger): number {
+  const limits = [os.totalmem()];
+  if (os.platform() === "linux") {
+    limits.push(
+      ...[
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "/sys/fs/cgroup/memory.max",
+      ]
+        .map((file) => getCgroupMemoryLimitBytes(file, logger))
+        .filter((limit) => limit !== undefined)
+        .map((limit) => limit as number),
+    );
+  }
+  const limit = Math.min(...limits);
+  logger.debug(
+    `While resolving RAM, determined that the total memory available to the Action is ${
+      limit / (1024 * 1024)
+    } MiB.`,
+  );
+  return limit;
+}
+
+/**
+ * Gets the number of bytes of available memory specified by the cgroup limit file at the given path.
+ *
+ * May be greater than the total memory reported by the operating system if there is no cgroup limit.
+ */
+function getCgroupMemoryLimitBytes(
+  limitFile: string,
+  logger: Logger,
+): number | undefined {
+  if (!fs.existsSync(limitFile)) {
+    logger.debug(
+      `While resolving RAM, did not find a cgroup memory limit at ${limitFile}.`,
+    );
+    return undefined;
+  }
+
+  const limit = Number(fs.readFileSync(limitFile, "utf8"));
+  if (!Number.isInteger(limit)) {
+    logger.debug(
+      `While resolving RAM, ignored the file ${limitFile} that may contain a cgroup memory limit ` +
+        "as this file did not contain an integer.",
+    );
+    return undefined;
+  }
+
+  const displayLimit = `${Math.floor(limit / (1024 * 1024))} MiB`;
+  if (limit < MINIMUM_CGROUP_MEMORY_LIMIT_BYTES) {
+    logger.info(
+      `While resolving RAM, ignored a cgroup limit of ${displayLimit} in ${limitFile} as it was below ${
+        MINIMUM_CGROUP_MEMORY_LIMIT_BYTES / (1024 * 1024)
+      } MiB.`,
+    );
+    return undefined;
+  }
+
+  logger.info(
+    `While resolving RAM, found a cgroup limit of ${displayLimit} in ${limitFile}.`,
+  );
+  return limit;
+}
+
+/**
+ * Get the value of the codeql `--ram` flag as configured by the `ram` input.
+ * If no value was specified, the total available memory will be used minus a
+ * threshold reserved for the OS.
+ *
+ * @returns {number} the amount of RAM to use, in megabytes
+ */
+export function getMemoryFlagValue(
+  userInput: string | undefined,
+  logger: Logger,
+): number {
+  return getMemoryFlagValueForPlatform(
+    userInput,
+    getTotalMemoryBytes(logger),
+    process.platform,
+  );
 }
 
 /**
@@ -183,8 +309,12 @@ export function getMemoryFlagValue(userInput: string | undefined): number {
  *
  * @returns string
  */
-export function getMemoryFlag(userInput: string | undefined): string {
-  return `--ram=${getMemoryFlagValue(userInput)}`;
+export function getMemoryFlag(
+  userInput: string | undefined,
+  logger: Logger,
+): string {
+  const megabytes = getMemoryFlagValue(userInput, logger);
+  return `--ram=${megabytes}`;
 }
 
 /**
@@ -193,7 +323,7 @@ export function getMemoryFlag(userInput: string | undefined): string {
  * @returns string
  */
 export function getAddSnippetsFlag(
-  userInput: string | boolean | undefined
+  userInput: string | boolean | undefined,
 ): string {
   if (typeof userInput === "string") {
     // have to process specifically because any non-empty string is truthy
@@ -212,7 +342,7 @@ export function getAddSnippetsFlag(
  */
 export function getThreadsFlagValue(
   userInput: string | undefined,
-  logger: Logger
+  logger: Logger,
 ): number {
   let numThreads: number;
   const maxThreads = os.cpus().length;
@@ -223,14 +353,14 @@ export function getThreadsFlagValue(
     }
     if (numThreads > maxThreads) {
       logger.info(
-        `Clamping desired number of threads (${numThreads}) to max available (${maxThreads}).`
+        `Clamping desired number of threads (${numThreads}) to max available (${maxThreads}).`,
       );
       numThreads = maxThreads;
     }
     const minThreads = -maxThreads;
     if (numThreads < minThreads) {
       logger.info(
-        `Clamping desired number of free threads (${numThreads}) to max available (${minThreads}).`
+        `Clamping desired number of free threads (${numThreads}) to max available (${minThreads}).`,
       );
       numThreads = minThreads;
     }
@@ -251,7 +381,7 @@ export function getThreadsFlagValue(
  */
 export function getThreadsFlag(
   userInput: string | undefined,
-  logger: Logger
+  logger: Logger,
 ): string {
   return `--threads=${getThreadsFlagValue(userInput, logger)}`;
 }
@@ -306,7 +436,6 @@ export function parseGitHubUrl(inputUrl: string): string {
   return url.toString();
 }
 
-const GITHUB_ENTERPRISE_VERSION_HEADER = "x-github-enterprise-version";
 const CODEQL_ACTION_WARNED_ABOUT_VERSION_ENV_VAR =
   "CODEQL_ACTION_WARNED_ABOUT_VERSION";
 
@@ -316,42 +445,17 @@ export enum GitHubVariant {
   DOTCOM,
   GHES,
   GHAE,
+  GHE_DOTCOM,
 }
 export type GitHubVersion =
   | { type: GitHubVariant.DOTCOM }
   | { type: GitHubVariant.GHAE }
+  | { type: GitHubVariant.GHE_DOTCOM }
   | { type: GitHubVariant.GHES; version: string };
-
-export async function getGitHubVersion(
-  apiDetails: GitHubApiDetails
-): Promise<GitHubVersion> {
-  // We can avoid making an API request in the standard dotcom case
-  if (parseGitHubUrl(apiDetails.url) === GITHUB_DOTCOM_URL) {
-    return { type: GitHubVariant.DOTCOM };
-  }
-
-  // Doesn't strictly have to be the meta endpoint as we're only
-  // using the response headers which are available on every request.
-  const apiClient = getApiClient();
-  const response = await apiClient.meta.get();
-
-  // This happens on dotcom, although we expect to have already returned in that
-  // case. This can also serve as a fallback in cases we haven't foreseen.
-  if (response.headers[GITHUB_ENTERPRISE_VERSION_HEADER] === undefined) {
-    return { type: GitHubVariant.DOTCOM };
-  }
-
-  if (response.headers[GITHUB_ENTERPRISE_VERSION_HEADER] === "GitHub AE") {
-    return { type: GitHubVariant.GHAE };
-  }
-
-  const version = response.headers[GITHUB_ENTERPRISE_VERSION_HEADER] as string;
-  return { type: GitHubVariant.GHES, version };
-}
 
 export function checkGitHubVersionInRange(
   version: GitHubVersion,
-  logger: Logger
+  logger: Logger,
 ) {
   if (hasBeenWarnedAboutVersion || version.type !== GitHubVariant.GHES) {
     return;
@@ -360,21 +464,21 @@ export function checkGitHubVersionInRange(
   const disallowedAPIVersionReason = apiVersionInRange(
     version.version,
     apiCompatibility.minimumVersion,
-    apiCompatibility.maximumVersion
+    apiCompatibility.maximumVersion,
   );
 
   if (
     disallowedAPIVersionReason === DisallowedAPIVersionReason.ACTION_TOO_OLD
   ) {
     logger.warning(
-      `The CodeQL Action version you are using is too old to be compatible with GitHub Enterprise ${version.version}. If you experience issues, please upgrade to a more recent version of the CodeQL Action.`
+      `The CodeQL Action version you are using is too old to be compatible with GitHub Enterprise ${version.version}. If you experience issues, please upgrade to a more recent version of the CodeQL Action.`,
     );
   }
   if (
     disallowedAPIVersionReason === DisallowedAPIVersionReason.ACTION_TOO_NEW
   ) {
     logger.warning(
-      `GitHub Enterprise ${version.version} is too old to be compatible with this version of the CodeQL Action. If you experience issues, please upgrade to a more recent version of GitHub Enterprise or use an older version of the CodeQL Action.`
+      `GitHub Enterprise ${version.version} is too old to be compatible with this version of the CodeQL Action. If you experience issues, please upgrade to a more recent version of GitHub Enterprise or use an older version of the CodeQL Action.`,
     );
   }
   hasBeenWarnedAboutVersion = true;
@@ -389,7 +493,7 @@ export enum DisallowedAPIVersionReason {
 export function apiVersionInRange(
   version: string,
   minimumVersion: string,
-  maximumVersion: string
+  maximumVersion: string,
 ): DisallowedAPIVersionReason | undefined {
   if (!semver.satisfies(version, `>=${minimumVersion}`)) {
     return DisallowedAPIVersionReason.ACTION_TOO_NEW;
@@ -418,63 +522,15 @@ export function assertNever(value: never): never {
 }
 
 /**
- * Environment variables to be set by codeql-action and used by the
- * CLI.
- */
-export enum EnvVar {
-  /**
-   * Semver of the codeql-action as specified in package.json.
-   */
-  VERSION = "CODEQL_ACTION_VERSION",
-
-  /**
-   * If set to a truthy value, then the codeql-action might combine SARIF
-   * output from several `interpret-results` runs for the same Language.
-   */
-  FEATURE_SARIF_COMBINE = "CODEQL_ACTION_FEATURE_SARIF_COMBINE",
-
-  /**
-   * If set to the "true" string, then the codeql-action will upload SARIF,
-   * not the cli.
-   */
-  FEATURE_WILL_UPLOAD = "CODEQL_ACTION_FEATURE_WILL_UPLOAD",
-
-  /**
-   * If set to the "true" string, then the codeql-action is using its
-   * own deprecated and non-standard way of scanning for multiple
-   * languages.
-   */
-  FEATURE_MULTI_LANGUAGE = "CODEQL_ACTION_FEATURE_MULTI_LANGUAGE",
-
-  /**
-   * If set to the "true" string, then the codeql-action is using its
-   * own sandwiched workflow mechanism
-   */
-  FEATURE_SANDWICH = "CODEQL_ACTION_FEATURE_SANDWICH",
-}
-
-/**
  * Set some initial environment variables that we can set even without
  * knowing what version of CodeQL we're running.
  */
 export function initializeEnvironment(version: string) {
-  core.exportVariable(EnvVar.VERSION, version);
-  core.exportVariable(EnvVar.FEATURE_SARIF_COMBINE, "true");
-  core.exportVariable(EnvVar.FEATURE_WILL_UPLOAD, "true");
-}
-
-/**
- * Enrich the environment variables with further flags that we cannot
- * know the value of until we know what version of CodeQL we're running.
- */
-export async function enrichEnvironment(codeql: CodeQL) {
-  if (await codeQlVersionAbove(codeql, CODEQL_VERSION_NEW_TRACING)) {
-    core.exportVariable(EnvVar.FEATURE_MULTI_LANGUAGE, "false");
-    core.exportVariable(EnvVar.FEATURE_SANDWICH, "false");
-  } else {
-    core.exportVariable(EnvVar.FEATURE_MULTI_LANGUAGE, "true");
-    core.exportVariable(EnvVar.FEATURE_SANDWICH, "true");
-  }
+  core.exportVariable(String(EnvVar.FEATURE_MULTI_LANGUAGE), "false");
+  core.exportVariable(String(EnvVar.FEATURE_SANDWICH), "false");
+  core.exportVariable(String(EnvVar.FEATURE_SARIF_COMBINE), "true");
+  core.exportVariable(String(EnvVar.FEATURE_WILL_UPLOAD), "true");
+  core.exportVariable(String(EnvVar.VERSION), version);
 }
 
 /**
@@ -526,7 +582,7 @@ export function getCachedCodeQlVersion(): undefined | string {
 
 export async function codeQlVersionAbove(
   codeql: CodeQL,
-  requiredVersion: string
+  requiredVersion: string,
 ): Promise<boolean> {
   return semver.gte(await codeql.getVersion(), requiredVersion);
 }
@@ -536,7 +592,7 @@ export async function bundleDb(
   config: Config,
   language: Language,
   codeql: CodeQL,
-  dbName: string
+  dbName: string,
 ) {
   const databasePath = getCodeQLDatabasePath(config, language);
   const databaseBundlePath = path.resolve(config.dbLocation, `${dbName}.zip`);
@@ -552,114 +608,36 @@ export async function bundleDb(
   return databaseBundlePath;
 }
 
-export async function delay(milliseconds: number) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+/**
+ * @param milliseconds time to delay
+ * @param opts options
+ * @param opts.allowProcessExit if true, the timer will not prevent the process from exiting
+ */
+export async function delay(
+  milliseconds: number,
+  { allowProcessExit }: { allowProcessExit: boolean },
+) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, milliseconds);
+    if (allowProcessExit) {
+      // Immediately `unref` the timer such that it only prevents the process from exiting if the
+      // surrounding promise is being awaited.
+      timer.unref();
+    }
+  });
 }
 
 export function isGoodVersion(versionSpec: string) {
   return !BROKEN_VERSIONS.includes(versionSpec);
 }
 
-export const ML_POWERED_JS_QUERIES_PACK_NAME =
-  "codeql/javascript-experimental-atm-queries";
-
 /**
- * Gets the ML-powered JS query pack to add to the analysis if a repo is opted into the ML-powered
- * queries beta.
+ * Checks whether the CodeQL CLI supports the `--expect-discarded-cache` command-line flag.
  */
-export async function getMlPoweredJsQueriesPack(
-  codeQL: CodeQL
-): Promise<string> {
-  let version;
-  if (await codeQlVersionAbove(codeQL, "2.11.3")) {
-    version = "~0.4.0";
-  } else if (await codeQlVersionAbove(codeQL, "2.9.3")) {
-    version = `~0.3.0`;
-  } else if (await codeQlVersionAbove(codeQL, "2.8.4")) {
-    version = `~0.2.0`;
-  } else {
-    version = `~0.1.0`;
-  }
-  return prettyPrintPack({
-    name: ML_POWERED_JS_QUERIES_PACK_NAME,
-    version,
-  });
-}
-
-/**
- * Get information about ML-powered JS queries to populate status reports with.
- *
- * This will be:
- *
- * - The version string if the analysis is using a single version of the ML-powered query pack.
- * - "latest" if the version string of the ML-powered query pack is undefined. This is unlikely to
- *   occur in practice (see comment below).
- * - "false" if the analysis won't run any ML-powered JS queries.
- * - "other" in all other cases.
- *
- * Our goal of the status report here is to allow us to compare the occurrence of timeouts and other
- * errors with ML-powered queries turned on and off. We also want to be able to compare minor
- * version bumps caused by us bumping the version range of `ML_POWERED_JS_QUERIES_PACK` in a new
- * version of the CodeQL Action. For instance, we might want to compare the `~0.1.0` and `~0.0.2`
- * version strings.
- *
- * This function lives here rather than in `init-action.ts` so it's easier to test, since tests for
- * `init-action.ts` would each need to live in their own file. See `analyze-action-env.ts` for an
- * explanation as to why this is.
- */
-export function getMlPoweredJsQueriesStatus(config: Config): string {
-  const mlPoweredJsQueryPacks = (config.packs.javascript || [])
-    .map((p) => parsePacksSpecification(p))
-    .filter(
-      (pack) =>
-        pack.name === "codeql/javascript-experimental-atm-queries" && !pack.path
-    );
-  switch (mlPoweredJsQueryPacks.length) {
-    case 1:
-      // We should always specify an explicit version string in `getMlPoweredJsQueriesPack`,
-      // otherwise we won't be able to make changes to the pack unless those changes are compatible
-      // with each version of the CodeQL Action. Therefore in practice we should only hit the
-      // `latest` case here when customers have explicitly added the ML-powered query pack to their
-      // CodeQL config.
-      return mlPoweredJsQueryPacks[0].version || "latest";
-    case 0:
-      return "false";
-    default:
-      return "other";
-  }
-}
-
-/**
- * Prompt the customer to upgrade to CodeQL Action v2, if appropriate.
- *
- * Check whether a customer is running v1. If they are, and we can determine that the GitHub
- * instance supports v2, then log a warning about v1's upcoming deprecation prompting the customer
- * to upgrade to v2.
- */
-export async function checkActionVersion(version: string) {
-  if (!semver.satisfies(version, ">=2")) {
-    const githubVersion = await api.getGitHubVersion();
-    // Only log a warning for versions of GHES that are compatible with CodeQL Action version 2.
-    //
-    // GHES 3.4 shipped without the v2 tag, but it also shipped without this warning message code.
-    // Therefore users who are seeing this warning message code have pulled in a new version of the
-    // Action, and with it the v2 tag.
-    if (
-      githubVersion.type === GitHubVariant.DOTCOM ||
-      githubVersion.type === GitHubVariant.GHAE ||
-      (githubVersion.type === GitHubVariant.GHES &&
-        semver.satisfies(
-          semver.coerce(githubVersion.version) ?? "0.0.0",
-          ">=3.4"
-        ))
-    ) {
-      core.warning(
-        "CodeQL Action v1 will be deprecated on January 18th, 2023. Please upgrade to v2. For " +
-          "more information, see " +
-          "https://github.blog/changelog/2022-04-27-code-scanning-deprecation-of-codeql-action-v1/"
-      );
-    }
-  }
+export async function supportExpectDiscardedCache(
+  codeQL: CodeQL,
+): Promise<boolean> {
+  return codeQlVersionAbove(codeQL, "2.12.1");
 }
 
 /*
@@ -668,34 +646,7 @@ export async function checkActionVersion(version: string) {
  * In test mode, we don't upload SARIF results or status reports to the GitHub API.
  */
 export function isInTestMode(): boolean {
-  return process.env[CODEQL_ACTION_TEST_MODE] === "true";
-}
-
-/**
- * @returns true if the action should generate a conde-scanning config file
- * that gets passed to the CLI.
- */
-export async function useCodeScanningConfigInCli(
-  codeql: CodeQL,
-  featureEnablement: FeatureEnablement
-): Promise<boolean> {
-  return await featureEnablement.getValue(Feature.CliConfigFileEnabled, codeql);
-}
-
-export async function logCodeScanningConfigInCli(
-  codeql: CodeQL,
-  featureEnablement: FeatureEnablement,
-  logger: Logger
-) {
-  if (await useCodeScanningConfigInCli(codeql, featureEnablement)) {
-    logger.info(
-      "Code Scanning configuration file being processed in the codeql CLI."
-    );
-  } else {
-    logger.info(
-      "Code Scanning configuration file being processed in the codeql-action."
-    );
-  }
+  return process.env[EnvVar.TEST_MODE] === "true";
 }
 
 /*
@@ -739,7 +690,7 @@ export function listFolder(dir: string): string[] {
  */
 export async function tryGetFolderBytes(
   cacheDir: string,
-  logger: Logger
+  logger: Logger,
 ): Promise<number | undefined> {
   try {
     return await promisify<string, number>(getFolderSize)(cacheDir);
@@ -774,7 +725,7 @@ let hadTimeout = false;
 export async function withTimeout<T>(
   timeoutMs: number,
   promise: Promise<T>,
-  onTimeout: () => void
+  onTimeout: () => void,
 ): Promise<T | undefined> {
   let finished = false;
   const mainTask = async () => {
@@ -782,21 +733,19 @@ export async function withTimeout<T>(
     finished = true;
     return result;
   };
-  const timeout: Promise<undefined> = new Promise((resolve) => {
-    setTimeout(() => {
-      if (!finished) {
-        // Workaround: While the promise racing below will allow the main code
-        // to continue, the process won't normally exit until the asynchronous
-        // task in the background has finished. We set this variable to force
-        // an exit at the end of our code when `checkForTimeout` is called.
-        hadTimeout = true;
-        onTimeout();
-      }
-      resolve(undefined);
-    }, timeoutMs);
-  });
-
-  return await Promise.race([mainTask(), timeout]);
+  const timeoutTask = async () => {
+    await delay(timeoutMs, { allowProcessExit: true });
+    if (!finished) {
+      // Workaround: While the promise racing below will allow the main code
+      // to continue, the process won't normally exit until the asynchronous
+      // task in the background has finished. We set this variable to force
+      // an exit at the end of our code when `checkForTimeout` is called.
+      hadTimeout = true;
+      onTimeout();
+    }
+    return undefined;
+  };
+  return await Promise.race([mainTask(), timeoutTask()]);
 }
 
 /**
@@ -808,9 +757,9 @@ export async function withTimeout<T>(
 export async function checkForTimeout() {
   if (hadTimeout === true) {
     core.info(
-      "A timeout occurred, force exiting the process after 30 seconds to prevent hanging."
+      "A timeout occurred, force exiting the process after 30 seconds to prevent hanging.",
     );
-    await delay(30_000);
+    await delay(30_000, { allowProcessExit: true });
     process.exit();
   }
 }
@@ -836,59 +785,172 @@ export function isHostedRunner() {
   );
 }
 
-/**
- *
- * @param featuresEnablement The features enabled for the current run
- * @param languagesInput Languages input from the workflow
- * @param repository The owner/name of the repository
- * @param logger A logger
- * @returns A boolean indicating whether or not the toolcache should be bypassed and the latest codeql should be downloaded.
- */
-export async function shouldBypassToolcache(
-  featuresEnablement: FeatureEnablement,
-  codeqlUrl: string | undefined,
-  languagesInput: string | undefined,
-  repository: RepositoryNwo,
-  logger: Logger
-): Promise<boolean> {
-  // An explicit codeql url is specified, that means the toolcache will not be used.
-  if (codeqlUrl) {
-    return true;
+export function parseMatrixInput(
+  matrixInput: string | undefined,
+): { [key: string]: string } | undefined {
+  if (matrixInput === undefined || matrixInput === "null") {
+    return undefined;
   }
+  return JSON.parse(matrixInput);
+}
 
-  // Check if the toolcache is disabled for all languages
-  if (await featuresEnablement.getValue(Feature.BypassToolcacheEnabled)) {
-    return true;
-  }
-
-  // Check if the toolcache is disabled for kotlin and swift.
-  if (
-    !(await featuresEnablement.getValue(
-      Feature.BypassToolcacheKotlinSwiftEnabled
-    ))
-  ) {
-    return false;
-  }
-
-  // Now check to see if kotlin or swift is one of the languages being analyzed.
-  const { rawLanguages, autodetected } = await getRawLanguages(
-    languagesInput,
-    repository,
-    logger
-  );
-  let bypass = rawLanguages.some((lang) => KOTLIN_SWIFT_BYPASS.includes(lang));
-  if (bypass) {
-    logger.info(
-      `Bypassing toolcache for kotlin or swift. Languages: ${rawLanguages}`
-    );
-  } else if (!autodetected && rawLanguages.includes(Language.java)) {
-    // special case: java was explicitly specified, but there might be
-    // some kotlin in the repository, so we need to make a request for that.
-    const langsInRepo = await getLanguagesInRepo(repository, logger);
-    if (langsInRepo.includes("kotlin")) {
-      logger.info(`Bypassing toolcache for kotlin.`);
-      bypass = true;
+function removeDuplicateLocations(locations: SarifLocation[]): SarifLocation[] {
+  const newJsonLocations = new Set<string>();
+  return locations.filter((location) => {
+    const jsonLocation = JSON.stringify(location);
+    if (!newJsonLocations.has(jsonLocation)) {
+      newJsonLocations.add(jsonLocation);
+      return true;
     }
+    return false;
+  });
+}
+
+export function fixInvalidNotifications(
+  sarif: SarifFile,
+  logger: Logger,
+): SarifFile {
+  if (!Array.isArray(sarif.runs)) {
+    return sarif;
   }
-  return bypass;
+
+  // Ensure that the array of locations for each SARIF notification contains unique locations.
+  // This is a workaround for a bug in the CodeQL CLI that causes duplicate locations to be
+  // emitted in some cases.
+  let numDuplicateLocationsRemoved = 0;
+
+  const newSarif = {
+    ...sarif,
+    runs: sarif.runs.map((run) => {
+      if (
+        run.tool?.driver?.name !== "CodeQL" ||
+        !Array.isArray(run.invocations)
+      ) {
+        return run;
+      }
+      return {
+        ...run,
+        invocations: run.invocations.map((invocation) => {
+          if (!Array.isArray(invocation.toolExecutionNotifications)) {
+            return invocation;
+          }
+          return {
+            ...invocation,
+            toolExecutionNotifications:
+              invocation.toolExecutionNotifications.map((notification) => {
+                if (!Array.isArray(notification.locations)) {
+                  return notification;
+                }
+                const newLocations = removeDuplicateLocations(
+                  notification.locations,
+                );
+                numDuplicateLocationsRemoved +=
+                  notification.locations.length - newLocations.length;
+                return {
+                  ...notification,
+                  locations: newLocations,
+                };
+              }),
+          };
+        }),
+      };
+    }),
+  };
+
+  if (numDuplicateLocationsRemoved > 0) {
+    logger.info(
+      `Removed ${numDuplicateLocationsRemoved} duplicate locations from SARIF notification ` +
+        "objects.",
+    );
+  } else {
+    logger.debug("No duplicate locations found in SARIF notification objects.");
+  }
+  return newSarif;
+}
+
+/**
+ * Removes duplicates from the sarif file.
+ *
+ * When `CODEQL_ACTION_DISABLE_DUPLICATE_LOCATION_FIX` is set to true, this will
+ * simply rename the input file to the output file. Otherwise, it will parse the
+ * input file as JSON, remove duplicate locations from the SARIF notification
+ * objects, and write the result to the output file.
+ *
+ * For context, see documentation of:
+ * `CODEQL_ACTION_DISABLE_DUPLICATE_LOCATION_FIX`. */
+export function fixInvalidNotificationsInFile(
+  inputPath: string,
+  outputPath: string,
+  logger: Logger,
+): void {
+  if (process.env[EnvVar.DISABLE_DUPLICATE_LOCATION_FIX] === "true") {
+    logger.info(
+      "SARIF notification object duplicate location fix disabled by the " +
+        `${EnvVar.DISABLE_DUPLICATE_LOCATION_FIX} environment variable.`,
+    );
+    fs.renameSync(inputPath, outputPath);
+  } else {
+    let sarif = JSON.parse(fs.readFileSync(inputPath, "utf8")) as SarifFile;
+    sarif = fixInvalidNotifications(sarif, logger);
+    fs.writeFileSync(outputPath, JSON.stringify(sarif));
+  }
+}
+
+export function wrapError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+export const ML_POWERED_JS_QUERIES_PACK_NAME =
+  "codeql/javascript-experimental-atm-queries";
+
+/**
+ * Gets the ML-powered JS query pack to add to the analysis if a repo is opted into the ML-powered
+ * queries beta.
+ */
+export async function getMlPoweredJsQueriesPack(
+  codeQL: CodeQL,
+): Promise<string> {
+  let version;
+  if (await codeQlVersionAbove(codeQL, "2.11.3")) {
+    version = "~0.4.0";
+  } else {
+    version = `~0.3.0`;
+  }
+  return prettyPrintPack({
+    name: ML_POWERED_JS_QUERIES_PACK_NAME,
+    version,
+  });
+}
+
+export function prettyPrintPack(pack: Pack) {
+  return `${pack.name}${pack.version ? `@${pack.version}` : ""}${
+    pack.path ? `:${pack.path}` : ""
+  }`;
+}
+
+export interface DiskUsage {
+  numAvailableBytes: number;
+  numTotalBytes: number;
+}
+
+export async function checkDiskUsage(logger?: Logger): Promise<DiskUsage> {
+  const diskUsage = await checkDiskSpace(
+    getRequiredEnvParam("GITHUB_WORKSPACE"),
+  );
+  const gbInBytes = 1024 * 1024 * 1024;
+  if (logger && diskUsage.free < 2 * gbInBytes) {
+    const message =
+      "The Actions runner is running low on disk space " +
+      `(${(diskUsage.free / gbInBytes).toPrecision(4)} GB available).`;
+    if (process.env[EnvVar.HAS_WARNED_ABOUT_DISK_SPACE] !== "true") {
+      logger.warning(message);
+    } else {
+      logger.debug(message);
+    }
+    core.exportVariable(EnvVar.HAS_WARNED_ABOUT_DISK_SPACE, "true");
+  }
+  return {
+    numAvailableBytes: diskUsage.free,
+    numTotalBytes: diskUsage.size,
+  };
 }

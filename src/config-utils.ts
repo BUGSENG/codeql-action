@@ -1,6 +1,5 @@
 import * as fs from "fs";
 import * as path from "path";
-// We need to import `performance` on Node 12
 import { performance } from "perf_hooks";
 
 import * as yaml from "js-yaml";
@@ -10,17 +9,18 @@ import * as api from "./api-client";
 import {
   CodeQL,
   CODEQL_VERSION_GHES_PACK_DOWNLOAD,
-  CODEQL_VERSION_ML_POWERED_QUERIES_WINDOWS,
+  CODEQL_VERSION_LANGUAGE_ALIASING,
+  CODEQL_VERSION_SECURITY_EXPERIMENTAL_SUITE,
   ResolveQueriesOutput,
 } from "./codeql";
 import * as externalQueries from "./external-queries";
-import { Feature, FeatureEnablement } from "./feature-flags";
 import {
-  Language,
-  LanguageOrAlias,
-  parseLanguage,
-  resolveAlias,
-} from "./languages";
+  Feature,
+  FeatureEnablement,
+  logCodeScanningConfigInCli,
+  useCodeScanningConfigInCli,
+} from "./feature-flags";
+import { Language, parseLanguage } from "./languages";
 import { Logger } from "./logging";
 import { RepositoryNwo } from "./repository";
 import { downloadTrapCaches } from "./trap-caching";
@@ -28,9 +28,9 @@ import {
   codeQlVersionAbove,
   getMlPoweredJsQueriesPack,
   GitHubVersion,
-  logCodeScanningConfigInCli,
   ML_POWERED_JS_QUERIES_PACK_NAME,
-  useCodeScanningConfigInCli,
+  prettyPrintPack,
+  UserError,
 } from "./util";
 
 // Property names from the user-supplied config file.
@@ -288,7 +288,7 @@ const DISABLED_BUILTIN_QUERIES: { [language: string]: string[] } = {
 
 function queryIsDisabled(language, query): boolean {
   return (DISABLED_BUILTIN_QUERIES[language] || []).some((disabledQuery) =>
-    query.endsWith(disabledQuery)
+    query.endsWith(disabledQuery),
   );
 }
 
@@ -300,24 +300,24 @@ function validateQueries(resolvedQueries: ResolveQueriesOutput) {
   const noDeclaredLanguage = resolvedQueries.noDeclaredLanguage;
   const noDeclaredLanguageQueries = Object.keys(noDeclaredLanguage);
   if (noDeclaredLanguageQueries.length !== 0) {
-    throw new Error(
+    throw new UserError(
       `${
         "The following queries do not declare a language. " +
         "Their qlpack.yml files are either missing or is invalid.\n"
-      }${noDeclaredLanguageQueries.join("\n")}`
+      }${noDeclaredLanguageQueries.join("\n")}`,
     );
   }
 
   const multipleDeclaredLanguages = resolvedQueries.multipleDeclaredLanguages;
   const multipleDeclaredLanguagesQueries = Object.keys(
-    multipleDeclaredLanguages
+    multipleDeclaredLanguages,
   );
   if (multipleDeclaredLanguagesQueries.length !== 0) {
-    throw new Error(
+    throw new UserError(
       `${
         "The following queries declare multiple languages. " +
         "Their qlpack.yml files are either missing or is invalid.\n"
-      }${multipleDeclaredLanguagesQueries.join("\n")}`
+      }${multipleDeclaredLanguagesQueries.join("\n")}`,
     );
   }
 }
@@ -334,11 +334,11 @@ async function runResolveQueries(
   codeQL: CodeQL,
   resultMap: Queries,
   toResolve: string[],
-  extraSearchPath: string | undefined
+  extraSearchPath: string | undefined,
 ) {
   const resolvedQueries = await codeQL.resolveQueries(
     toResolve,
-    extraSearchPath
+    extraSearchPath,
   );
 
   if (extraSearchPath !== undefined) {
@@ -346,7 +346,7 @@ async function runResolveQueries(
   }
 
   for (const [language, queryPaths] of Object.entries(
-    resolvedQueries.byLanguage
+    resolvedQueries.byLanguage,
   )) {
     if (resultMap[language] === undefined) {
       resultMap[language] = {
@@ -355,7 +355,7 @@ async function runResolveQueries(
       };
     }
     const queries = Object.keys(queryPaths).filter(
-      (q) => !queryIsDisabled(language, q)
+      (q) => !queryIsDisabled(language, q),
     );
     if (extraSearchPath !== undefined) {
       resultMap[language].custom.push({
@@ -374,14 +374,18 @@ async function runResolveQueries(
 async function addDefaultQueries(
   codeQL: CodeQL,
   languages: string[],
-  resultMap: Queries
+  resultMap: Queries,
 ) {
   const suites = languages.map((l) => `${l}-code-scanning.qls`);
   await runResolveQueries(codeQL, resultMap, suites, undefined);
 }
 
 // The set of acceptable values for built-in suites from the codeql bundle
-const builtinSuites = ["security-extended", "security-and-quality"] as const;
+const builtinSuites = [
+  "security-experimental",
+  "security-extended",
+  "security-and-quality",
+] as const;
 
 /**
  * Determine the set of queries associated with suiteName's suites and add them to resultMap.
@@ -394,29 +398,38 @@ async function addBuiltinSuiteQueries(
   resultMap: Queries,
   packs: Packs,
   suiteName: string,
-  featureEnablement: FeatureEnablement,
-  configFile?: string
+  features: FeatureEnablement,
+  configFile?: string,
 ): Promise<boolean> {
   let injectedMlQueries = false;
   const found = builtinSuites.find((suite) => suite === suiteName);
   if (!found) {
-    throw new Error(getQueryUsesInvalid(configFile, suiteName));
+    throw new UserError(getQueryUsesInvalid(configFile, suiteName));
+  }
+  if (
+    suiteName === "security-experimental" &&
+    !(await codeQlVersionAbove(
+      codeQL,
+      CODEQL_VERSION_SECURITY_EXPERIMENTAL_SUITE,
+    ))
+  ) {
+    throw new UserError(
+      `The 'security-experimental' suite is not supported on CodeQL CLI versions earlier than
+      ${CODEQL_VERSION_SECURITY_EXPERIMENTAL_SUITE}. Please upgrade to CodeQL CLI version
+      ${CODEQL_VERSION_SECURITY_EXPERIMENTAL_SUITE} or later.`,
+    );
   }
 
   // If we're running the JavaScript security-extended analysis (or a superset of it), the repo is
   // opted into the ML-powered queries beta, and a user hasn't already added the ML-powered query
   // pack, then add the ML-powered query pack so that we run ML-powered queries.
   if (
-    // Only run ML-powered queries on Windows if we have a CLI that supports it.
-    (process.platform !== "win32" ||
-      (await codeQlVersionAbove(
-        codeQL,
-        CODEQL_VERSION_ML_POWERED_QUERIES_WINDOWS
-      ))) &&
     languages.includes("javascript") &&
-    (found === "security-extended" || found === "security-and-quality") &&
+    (found === "security-experimental" ||
+      found === "security-extended" ||
+      found === "security-and-quality") &&
     !packs.javascript?.some(isMlPoweredJsQueriesPack) &&
-    (await featureEnablement.getValue(Feature.MlPoweredQueriesEnabled, codeQL))
+    (await features.getValue(Feature.MlPoweredQueriesEnabled, codeQL))
   ) {
     if (!packs.javascript) {
       packs.javascript = [];
@@ -442,7 +455,7 @@ async function addLocalQueries(
   resultMap: Queries,
   localQueryPath: string,
   workspacePath: string,
-  configFile?: string
+  configFile?: string,
 ) {
   // Resolve the local path against the workspace so that when this is
   // passed to codeql it resolves to exactly the path we expect it to resolve to.
@@ -450,7 +463,7 @@ async function addLocalQueries(
 
   // Check the file exists
   if (!fs.existsSync(absoluteQueryPath)) {
-    throw new Error(getLocalPathDoesNotExist(configFile, localQueryPath));
+    throw new UserError(getLocalPathDoesNotExist(configFile, localQueryPath));
   }
 
   // Call this after checking file exists, because it'll fail if file doesn't exist
@@ -459,11 +472,11 @@ async function addLocalQueries(
   // Check the local path doesn't jump outside the repo using '..' or symlinks
   if (
     !(absoluteQueryPath + path.sep).startsWith(
-      fs.realpathSync(workspacePath) + path.sep
+      fs.realpathSync(workspacePath) + path.sep,
     )
   ) {
-    throw new Error(
-      getLocalPathOutsideOfRepository(configFile, localQueryPath)
+    throw new UserError(
+      getLocalPathOutsideOfRepository(configFile, localQueryPath),
     );
   }
 
@@ -473,7 +486,7 @@ async function addLocalQueries(
     codeQL,
     resultMap,
     [absoluteQueryPath],
-    extraSearchPath
+    extraSearchPath,
   );
 }
 
@@ -487,11 +500,11 @@ async function addRemoteQueries(
   tempDir: string,
   apiDetails: api.GitHubApiExternalRepoDetails,
   logger: Logger,
-  configFile?: string
+  configFile?: string,
 ) {
   let tok = queryUses.split("@");
   if (tok.length !== 2) {
-    throw new Error(getQueryUsesInvalid(configFile, queryUses));
+    throw new UserError(getQueryUsesInvalid(configFile, queryUses));
   }
 
   const ref = tok[1];
@@ -501,11 +514,11 @@ async function addRemoteQueries(
   // The second token is the repo
   // The rest is a path, if there is more than one token combine them to form the full path
   if (tok.length < 2) {
-    throw new Error(getQueryUsesInvalid(configFile, queryUses));
+    throw new UserError(getQueryUsesInvalid(configFile, queryUses));
   }
   // Check none of the parts of the repository name are empty
   if (tok[0].trim() === "" || tok[1].trim() === "") {
-    throw new Error(getQueryUsesInvalid(configFile, queryUses));
+    throw new UserError(getQueryUsesInvalid(configFile, queryUses));
   }
   const nwo = `${tok[0]}/${tok[1]}`;
 
@@ -515,7 +528,7 @@ async function addRemoteQueries(
     ref,
     apiDetails,
     tempDir,
-    logger
+    logger,
   );
 
   const queryPath =
@@ -548,13 +561,13 @@ async function parseQueryUses(
   tempDir: string,
   workspacePath: string,
   apiDetails: api.GitHubApiExternalRepoDetails,
-  featureEnablement: FeatureEnablement,
+  features: FeatureEnablement,
   logger: Logger,
-  configFile?: string
+  configFile?: string,
 ): Promise<boolean> {
   queryUses = queryUses.trim();
   if (queryUses === "") {
-    throw new Error(getQueryUsesInvalid(configFile));
+    throw new UserError(getQueryUsesInvalid(configFile));
   }
 
   // Check for the local path case before we start trying to parse the repository name
@@ -564,7 +577,7 @@ async function parseQueryUses(
       resultMap,
       queryUses.slice(2),
       workspacePath,
-      configFile
+      configFile,
     );
     return false;
   }
@@ -577,21 +590,25 @@ async function parseQueryUses(
       resultMap,
       packs,
       queryUses,
-      featureEnablement,
-      configFile
+      features,
+      configFile,
     );
   }
 
-  // Otherwise, must be a reference to another repo
-  await addRemoteQueries(
-    codeQL,
-    resultMap,
-    queryUses,
-    tempDir,
-    apiDetails,
-    logger,
-    configFile
-  );
+  // Otherwise, must be a reference to another repo.
+  // If config parsing is handled in CLI, then this repo will be downloaded
+  // later by the CLI.
+  if (!(await useCodeScanningConfigInCli(codeQL, features))) {
+    await addRemoteQueries(
+      codeQL,
+      resultMap,
+      queryUses,
+      tempDir,
+      apiDetails,
+      logger,
+      configFile,
+    );
+  }
   return false;
 }
 
@@ -610,7 +627,7 @@ export function validateAndSanitisePath(
   originalPath: string,
   propertyName: string,
   configFile: string,
-  logger: Logger
+  logger: Logger,
 ): string {
   // Take a copy so we don't modify the original path, so we can still construct error messages
   let newPath = originalPath;
@@ -627,25 +644,25 @@ export function validateAndSanitisePath(
 
   // An empty path is not allowed as it's meaningless
   if (newPath === "") {
-    throw new Error(
+    throw new UserError(
       getConfigFilePropertyError(
         configFile,
         propertyName,
         `"${originalPath}" is not an invalid path. ` +
-          `It is not necessary to include it, and it is not allowed to exclude it.`
-      )
+          `It is not necessary to include it, and it is not allowed to exclude it.`,
+      ),
     );
   }
 
   // Check for illegal uses of **
   if (newPath.match(pathStarsRegex)) {
-    throw new Error(
+    throw new UserError(
       getConfigFilePropertyError(
         configFile,
         propertyName,
         `"${originalPath}" contains an invalid "**" wildcard. ` +
-          `They must be immediately preceded and followed by a slash as in "/**/", or come at the start or end.`
-      )
+          `They must be immediately preceded and followed by a slash as in "/**/", or come at the start or end.`,
+      ),
     );
   }
 
@@ -657,8 +674,8 @@ export function validateAndSanitisePath(
         configFile,
         propertyName,
         `"${originalPath}" contains an unsupported character. ` +
-          `The filter pattern characters ?, +, [, ], ! are not supported and will be matched literally.`
-      )
+          `The filter pattern characters ?, +, [, ], ! are not supported and will be matched literally.`,
+      ),
     );
   }
 
@@ -666,13 +683,13 @@ export function validateAndSanitisePath(
   // This may not play nicely with project layouts.
   // This restriction can be lifted later if we determine they are ok.
   if (newPath.indexOf("\\") !== -1) {
-    throw new Error(
+    throw new UserError(
       getConfigFilePropertyError(
         configFile,
         propertyName,
         `"${originalPath}" contains an "\\" character. These are not allowed in filters. ` +
-          `If running on windows we recommend using "/" instead for path filters.`
-      )
+          `If running on windows we recommend using "/" instead for path filters.`,
+      ),
     );
   }
 
@@ -686,7 +703,7 @@ export function getNameInvalid(configFile: string): string {
   return getConfigFilePropertyError(
     configFile,
     NAME_PROPERTY,
-    "must be a non-empty string"
+    "must be a non-empty string",
   );
 }
 
@@ -694,7 +711,7 @@ export function getDisableDefaultQueriesInvalid(configFile: string): string {
   return getConfigFilePropertyError(
     configFile,
     DISABLE_DEFAULT_QUERIES_PROPERTY,
-    "must be a boolean"
+    "must be a boolean",
   );
 }
 
@@ -702,7 +719,7 @@ export function getQueriesInvalid(configFile: string): string {
   return getConfigFilePropertyError(
     configFile,
     QUERIES_PROPERTY,
-    "must be an array"
+    "must be an array",
   );
 }
 
@@ -710,22 +727,22 @@ export function getQueriesMissingUses(configFile: string): string {
   return getConfigFilePropertyError(
     configFile,
     QUERIES_PROPERTY,
-    "must be an array, with each entry having a 'uses' property"
+    "must be an array, with each entry having a 'uses' property",
   );
 }
 
 export function getQueryUsesInvalid(
   configFile: string | undefined,
-  queryUses?: string
+  queryUses?: string,
 ): string {
   return getConfigFilePropertyError(
     configFile,
     `${QUERIES_PROPERTY}.${QUERIES_USES_PROPERTY}`,
     `must be a built-in suite (${builtinSuites.join(
-      " or "
+      " or ",
     )}), a relative path, or be of the form "owner/repo[/path]@ref"${
       queryUses !== undefined ? `\n Found: ${queryUses}` : ""
-    }`
+    }`,
   );
 }
 
@@ -733,7 +750,7 @@ export function getPathsIgnoreInvalid(configFile: string): string {
   return getConfigFilePropertyError(
     configFile,
     PATHS_IGNORE_PROPERTY,
-    "must be an array of non-empty strings"
+    "must be an array of non-empty strings",
   );
 }
 
@@ -741,7 +758,7 @@ export function getPathsInvalid(configFile: string): string {
   return getConfigFilePropertyError(
     configFile,
     PATHS_PROPERTY,
-    "must be an array of non-empty strings"
+    "must be an array of non-empty strings",
   );
 }
 
@@ -749,7 +766,7 @@ function getPacksRequireLanguage(lang: string, configFile: string): string {
   return getConfigFilePropertyError(
     configFile,
     PACKS_PROPERTY,
-    `has "${lang}", but it is not a valid language.`
+    `has "${lang}", but it is not a valid language.`,
   );
 }
 
@@ -757,7 +774,7 @@ export function getPacksInvalidSplit(configFile: string): string {
   return getConfigFilePropertyError(
     configFile,
     PACKS_PROPERTY,
-    "must split packages by language"
+    "must split packages by language",
   );
 }
 
@@ -765,59 +782,59 @@ export function getPacksInvalid(configFile: string): string {
   return getConfigFilePropertyError(
     configFile,
     PACKS_PROPERTY,
-    "must be an array of non-empty strings"
+    "must be an array of non-empty strings",
   );
 }
 
 export function getPacksStrInvalid(
   packStr: string,
-  configFile?: string
+  configFile?: string,
 ): string {
   return configFile
     ? getConfigFilePropertyError(
         configFile,
         PACKS_PROPERTY,
-        `"${packStr}" is not a valid pack`
+        `"${packStr}" is not a valid pack`,
       )
     : `"${packStr}" is not a valid pack`;
 }
 
 export function getLocalPathOutsideOfRepository(
   configFile: string | undefined,
-  localPath: string
+  localPath: string,
 ): string {
   return getConfigFilePropertyError(
     configFile,
     `${QUERIES_PROPERTY}.${QUERIES_USES_PROPERTY}`,
-    `is invalid as the local path "${localPath}" is outside of the repository`
+    `is invalid as the local path "${localPath}" is outside of the repository`,
   );
 }
 
 export function getLocalPathDoesNotExist(
   configFile: string | undefined,
-  localPath: string
+  localPath: string,
 ): string {
   return getConfigFilePropertyError(
     configFile,
     `${QUERIES_PROPERTY}.${QUERIES_USES_PROPERTY}`,
-    `is invalid as the local path "${localPath}" does not exist in the repository`
+    `is invalid as the local path "${localPath}" does not exist in the repository`,
   );
 }
 
 export function getConfigFileOutsideWorkspaceErrorMessage(
-  configFile: string
+  configFile: string,
 ): string {
   return `The configuration file "${configFile}" is outside of the workspace`;
 }
 
 export function getConfigFileDoesNotExistErrorMessage(
-  configFile: string
+  configFile: string,
 ): string {
   return `The configuration file "${configFile}" does not exist`;
 }
 
 export function getConfigFileRepoFormatInvalidMessage(
-  configFile: string
+  configFile: string,
 ): string {
   let error = `The configuration file "${configFile}" is not a supported remote file reference.`;
   error += " Expected format <owner>/<repository>/<file-path>@<ref>";
@@ -836,7 +853,7 @@ export function getConfigFileDirectoryGivenMessage(configFile: string): string {
 function getConfigFilePropertyError(
   configFile: string | undefined,
   property: string,
-  error: string
+  error: string,
 ): string {
   if (configFile === undefined) {
     return `The workflow property "${property}" is invalid: ${error}`;
@@ -853,7 +870,7 @@ export function getNoLanguagesError(): string {
 }
 
 export function getUnknownLanguagesError(languages: string[]): string {
-  return `Did not recognise the following languages: ${languages.join(", ")}`;
+  return `Did not recognize the following languages: ${languages.join(", ")}`;
 }
 
 /**
@@ -862,10 +879,10 @@ export function getUnknownLanguagesError(languages: string[]): string {
  */
 export async function getLanguagesInRepo(
   repository: RepositoryNwo,
-  logger: Logger
-): Promise<LanguageOrAlias[]> {
+  logger: Logger,
+): Promise<Language[]> {
   logger.debug(`GitHub repo ${repository.owner} ${repository.repo}`);
-  const response = await api.getApiClient().repos.listLanguages({
+  const response = await api.getApiClient().rest.repos.listLanguages({
     owner: repository.owner,
     repo: repository.repo,
   });
@@ -876,8 +893,8 @@ export async function getLanguagesInRepo(
   // When we pick a language to autobuild we want to pick the most popular traced language
   // Since sets in javascript maintain insertion order, using a set here and then splatting it
   // into an array gives us an array of languages ordered by popularity
-  const languages: Set<LanguageOrAlias> = new Set();
-  for (const lang of Object.keys(response.data)) {
+  const languages: Set<Language> = new Set();
+  for (const lang of Object.keys(response.data as Record<string, number>)) {
     const parsedLang = parseLanguage(lang);
     if (parsedLang !== undefined) {
       languages.add(parsedLang);
@@ -900,36 +917,44 @@ export async function getLanguages(
   codeQL: CodeQL,
   languagesInput: string | undefined,
   repository: RepositoryNwo,
-  logger: Logger
+  logger: Logger,
 ): Promise<Language[]> {
   // Obtain languages without filtering them.
   const { rawLanguages, autodetected } = await getRawLanguages(
     languagesInput,
     repository,
-    logger
+    logger,
   );
 
-  let languages = rawLanguages.map(resolveAlias);
-
+  let languages = rawLanguages;
   if (autodetected) {
-    const availableLanguages = await codeQL.resolveLanguages();
-    languages = languages.filter((value) => value in availableLanguages);
+    const supportedLanguages = Object.keys(await codeQL.resolveLanguages());
+
+    languages = languages
+      .map(parseLanguage)
+      .filter((value) => value && supportedLanguages.includes(value))
+      .map((value) => value as Language);
+
     logger.info(`Automatically detected languages: ${languages.join(", ")}`);
   } else {
+    const aliases = await getLanguageAliases(codeQL);
+    if (aliases) {
+      languages = languages.map((lang) => aliases[lang] || lang);
+    }
+
     logger.info(`Languages from configuration: ${languages.join(", ")}`);
   }
 
   // If the languages parameter was not given and no languages were
   // detected then fail here as this is a workflow configuration error.
   if (languages.length === 0) {
-    throw new Error(getNoLanguagesError());
+    throw new UserError(getNoLanguagesError());
   }
 
   // Make sure they are supported
   const parsedLanguages: Language[] = [];
   const unknownLanguages: string[] = [];
   for (const language of languages) {
-    // We know this is not an alias since we resolved it above.
     const parsedLanguage = parseLanguage(language) as Language;
     if (parsedLanguage === undefined) {
       unknownLanguages.push(language);
@@ -941,10 +966,23 @@ export async function getLanguages(
   // Any unknown languages here would have come directly from the input
   // since we filter unknown languages coming from the GitHub API.
   if (unknownLanguages.length > 0) {
-    throw new Error(getUnknownLanguagesError(unknownLanguages));
+    throw new UserError(getUnknownLanguagesError(unknownLanguages));
   }
 
   return parsedLanguages;
+}
+
+/**
+ * Gets the set of languages supported by CodeQL, along with their aliases if supported by the
+ * version of the CLI.
+ */
+export async function getLanguageAliases(
+  codeql: CodeQL,
+): Promise<{ [alias: string]: string } | undefined> {
+  if (await codeQlVersionAbove(codeql, CODEQL_VERSION_LANGUAGE_ALIASING)) {
+    return (await codeql.betterResolveLanguages()).aliases;
+  }
+  return undefined;
 }
 
 /**
@@ -960,7 +998,7 @@ export async function getLanguages(
 export async function getRawLanguages(
   languagesInput: string | undefined,
   repository: RepositoryNwo,
-  logger: Logger
+  logger: Logger,
 ) {
   // Obtain from action input 'languages' if set
   let rawLanguages = (languagesInput || "")
@@ -988,8 +1026,8 @@ async function addQueriesAndPacksFromWorkflow(
   tempDir: string,
   workspacePath: string,
   apiDetails: api.GitHubApiExternalRepoDetails,
-  featureEnablement: FeatureEnablement,
-  logger: Logger
+  features: FeatureEnablement,
+  logger: Logger,
 ): Promise<boolean> {
   let injectedMlQueries = false;
   queriesInput = queriesInput.trim();
@@ -1006,8 +1044,8 @@ async function addQueriesAndPacksFromWorkflow(
       tempDir,
       workspacePath,
       apiDetails,
-      featureEnablement,
-      logger
+      features,
+      logger,
     );
     injectedMlQueries = injectedMlQueries || didInject;
   }
@@ -1045,14 +1083,14 @@ export async function getDefaultConfig(
   workspacePath: string,
   gitHubVersion: GitHubVersion,
   apiDetails: api.GitHubApiCombinedDetails,
-  featureEnablement: FeatureEnablement,
-  logger: Logger
+  features: FeatureEnablement,
+  logger: Logger,
 ): Promise<Config> {
   const languages = await getLanguages(
     codeQL,
     languagesInput,
     repository,
-    logger
+    logger,
   );
   const queries: Queries = {};
   for (const language of languages) {
@@ -1065,7 +1103,7 @@ export async function getDefaultConfig(
   const augmentationProperties = calculateAugmentation(
     rawPacksInput,
     rawQueriesInput,
-    languages
+    languages,
   );
   const packs = augmentationProperties.packsInput
     ? {
@@ -1083,8 +1121,8 @@ export async function getDefaultConfig(
         tempDir,
         workspacePath,
         apiDetails,
-        featureEnablement,
-        logger
+        features,
+        logger,
       );
   }
 
@@ -1092,7 +1130,7 @@ export async function getDefaultConfig(
     trapCachingEnabled,
     codeQL,
     languages,
-    logger
+    logger,
   );
 
   return {
@@ -1119,7 +1157,7 @@ async function downloadCacheWithTime(
   trapCachingEnabled: boolean,
   codeQL: CodeQL,
   languages: Language[],
-  logger: Logger
+  logger: Logger,
 ): Promise<{
   trapCaches: Partial<Record<Language, string>>;
   trapCacheDownloadTime: number;
@@ -1153,8 +1191,8 @@ async function loadConfig(
   workspacePath: string,
   gitHubVersion: GitHubVersion,
   apiDetails: api.GitHubApiCombinedDetails,
-  featureEnablement: FeatureEnablement,
-  logger: Logger
+  features: FeatureEnablement,
+  logger: Logger,
 ): Promise<Config> {
   let parsedYAML: UserConfig;
 
@@ -1170,10 +1208,10 @@ async function loadConfig(
   // even though we don't use the value yet.
   if (NAME_PROPERTY in parsedYAML) {
     if (typeof parsedYAML[NAME_PROPERTY] !== "string") {
-      throw new Error(getNameInvalid(configFile));
+      throw new UserError(getNameInvalid(configFile));
     }
     if (parsedYAML[NAME_PROPERTY]!.length === 0) {
-      throw new Error(getNameInvalid(configFile));
+      throw new UserError(getNameInvalid(configFile));
     }
   }
 
@@ -1181,7 +1219,7 @@ async function loadConfig(
     codeQL,
     languagesInput,
     repository,
-    logger
+    logger,
   );
 
   const queries: Queries = {};
@@ -1197,7 +1235,7 @@ async function loadConfig(
   let disableDefaultQueries = false;
   if (DISABLE_DEFAULT_QUERIES_PROPERTY in parsedYAML) {
     if (typeof parsedYAML[DISABLE_DEFAULT_QUERIES_PROPERTY] !== "boolean") {
-      throw new Error(getDisableDefaultQueriesInvalid(configFile));
+      throw new UserError(getDisableDefaultQueriesInvalid(configFile));
     }
     disableDefaultQueries = parsedYAML[DISABLE_DEFAULT_QUERIES_PROPERTY]!;
   }
@@ -1207,7 +1245,7 @@ async function loadConfig(
   const augmentationProperties = calculateAugmentation(
     rawPacksInput,
     rawQueriesInput,
-    languages
+    languages,
   );
   const packs = parsePacks(
     parsedYAML[PACKS_PROPERTY] ?? {},
@@ -1215,7 +1253,7 @@ async function loadConfig(
     augmentationProperties.packsInputCombines,
     languages,
     configFile,
-    logger
+    logger,
   );
 
   // If queries were provided using `with` in the action configuration,
@@ -1233,8 +1271,8 @@ async function loadConfig(
         tempDir,
         workspacePath,
         apiDetails,
-        featureEnablement,
-        logger
+        features,
+        logger,
       );
   }
   if (
@@ -1243,11 +1281,11 @@ async function loadConfig(
   ) {
     const queriesArr = parsedYAML[QUERIES_PROPERTY];
     if (!Array.isArray(queriesArr)) {
-      throw new Error(getQueriesInvalid(configFile));
+      throw new UserError(getQueriesInvalid(configFile));
     }
     for (const query of queriesArr) {
       if (typeof query[QUERIES_USES_PROPERTY] !== "string") {
-        throw new Error(getQueriesMissingUses(configFile));
+        throw new UserError(getQueriesMissingUses(configFile));
       }
       await parseQueryUses(
         languages,
@@ -1258,42 +1296,47 @@ async function loadConfig(
         tempDir,
         workspacePath,
         apiDetails,
-        featureEnablement,
+        features,
         logger,
-        configFile
+        configFile,
       );
     }
   }
 
   if (PATHS_IGNORE_PROPERTY in parsedYAML) {
     if (!Array.isArray(parsedYAML[PATHS_IGNORE_PROPERTY])) {
-      throw new Error(getPathsIgnoreInvalid(configFile));
+      throw new UserError(getPathsIgnoreInvalid(configFile));
     }
     for (const ignorePath of parsedYAML[PATHS_IGNORE_PROPERTY]!) {
       if (typeof ignorePath !== "string" || ignorePath === "") {
-        throw new Error(getPathsIgnoreInvalid(configFile));
+        throw new UserError(getPathsIgnoreInvalid(configFile));
       }
       pathsIgnore.push(
         validateAndSanitisePath(
           ignorePath,
           PATHS_IGNORE_PROPERTY,
           configFile,
-          logger
-        )
+          logger,
+        ),
       );
     }
   }
 
   if (PATHS_PROPERTY in parsedYAML) {
     if (!Array.isArray(parsedYAML[PATHS_PROPERTY])) {
-      throw new Error(getPathsInvalid(configFile));
+      throw new UserError(getPathsInvalid(configFile));
     }
     for (const includePath of parsedYAML[PATHS_PROPERTY]!) {
       if (typeof includePath !== "string" || includePath === "") {
-        throw new Error(getPathsInvalid(configFile));
+        throw new UserError(getPathsInvalid(configFile));
       }
       paths.push(
-        validateAndSanitisePath(includePath, PATHS_PROPERTY, configFile, logger)
+        validateAndSanitisePath(
+          includePath,
+          PATHS_PROPERTY,
+          configFile,
+          logger,
+        ),
       );
     }
   }
@@ -1302,7 +1345,7 @@ async function loadConfig(
     trapCachingEnabled,
     codeQL,
     languages,
-    logger
+    logger,
   );
 
   return {
@@ -1347,18 +1390,18 @@ async function loadConfig(
 export function calculateAugmentation(
   rawPacksInput: string | undefined,
   rawQueriesInput: string | undefined,
-  languages: Language[]
+  languages: Language[],
 ): AugmentationProperties {
   const packsInputCombines = shouldCombine(rawPacksInput);
   const packsInput = parsePacksFromInput(
     rawPacksInput,
     languages,
-    packsInputCombines
+    packsInputCombines,
   );
   const queriesInputCombines = shouldCombine(rawQueriesInput);
   const queriesInput = parseQueriesFromInput(
     rawQueriesInput,
-    queriesInputCombines
+    queriesInputCombines,
   );
 
   return {
@@ -1372,7 +1415,7 @@ export function calculateAugmentation(
 
 function parseQueriesFromInput(
   rawQueriesInput: string | undefined,
-  queriesInputCombines: boolean
+  queriesInputCombines: boolean,
 ) {
   if (!rawQueriesInput) {
     return undefined;
@@ -1380,14 +1423,14 @@ function parseQueriesFromInput(
 
   const trimmedInput = queriesInputCombines
     ? rawQueriesInput.trim().slice(1).trim()
-    : rawQueriesInput?.trim();
+    : rawQueriesInput?.trim() ?? "";
   if (queriesInputCombines && trimmedInput.length === 0) {
-    throw new Error(
+    throw new UserError(
       getConfigFilePropertyError(
         undefined,
         "queries",
-        "A '+' was used in the 'queries' input to specify that you wished to add some packs to your CodeQL analysis. However, no packs were specified. Please either remove the '+' or specify some packs."
-      )
+        "A '+' was used in the 'queries' input to specify that you wished to add some packs to your CodeQL analysis. However, no packs were specified. Please either remove the '+' or specify some packs.",
+      ),
     );
   }
   return trimmedInput.split(",").map((query) => ({ uses: query.trim() }));
@@ -1409,7 +1452,7 @@ export function parsePacksFromConfig(
   packsByLanguage: string[] | Record<string, string[]>,
   languages: Language[],
   configFile: string,
-  logger: Logger
+  logger: Logger,
 ): Packs {
   const packs = {};
 
@@ -1422,29 +1465,29 @@ export function parsePacksFromConfig(
     } else {
       // this is an error since multi-language analysis requires
       // packs split by language
-      throw new Error(getPacksInvalidSplit(configFile));
+      throw new UserError(getPacksInvalidSplit(configFile));
     }
   }
 
   for (const [lang, packsArr] of Object.entries(packsByLanguage)) {
     if (!Array.isArray(packsArr)) {
-      throw new Error(getPacksInvalid(configFile));
+      throw new UserError(getPacksInvalid(configFile));
     }
     if (!languages.includes(lang as Language)) {
       // This particular language is not being analyzed in this run.
       if (Language[lang as Language]) {
         logger.info(
-          `Ignoring packs for ${lang} since this language is not being analyzed in this run.`
+          `Ignoring packs for ${lang} since this language is not being analyzed in this run.`,
         );
         continue;
       } else {
         // This language is invalid, probably a misspelling
-        throw new Error(getPacksRequireLanguage(configFile, lang));
+        throw new UserError(getPacksRequireLanguage(configFile, lang));
       }
     }
 
     packs[lang] = packsArr.map((packStr) =>
-      validatePackSpecification(packStr, configFile)
+      validatePackSpecification(packStr, configFile),
     );
   }
   return packs;
@@ -1453,30 +1496,32 @@ export function parsePacksFromConfig(
 function parsePacksFromInput(
   rawPacksInput: string | undefined,
   languages: Language[],
-  packsInputCombines: boolean
+  packsInputCombines: boolean,
 ): Packs | undefined {
   if (!rawPacksInput?.trim()) {
     return undefined;
   }
 
   if (languages.length > 1) {
-    throw new Error(
-      "Cannot specify a 'packs' input in a multi-language analysis. Use a codeql-config.yml file instead and specify packs by language."
+    throw new UserError(
+      "Cannot specify a 'packs' input in a multi-language analysis. Use a codeql-config.yml file instead and specify packs by language.",
     );
   } else if (languages.length === 0) {
-    throw new Error("No languages specified. Cannot process the packs input.");
+    throw new UserError(
+      "No languages specified. Cannot process the packs input.",
+    );
   }
 
   rawPacksInput = rawPacksInput.trim();
   if (packsInputCombines) {
     rawPacksInput = rawPacksInput.trim().substring(1).trim();
     if (!rawPacksInput) {
-      throw new Error(
+      throw new UserError(
         getConfigFilePropertyError(
           undefined,
           "packs",
-          "A '+' was used in the 'packs' input to specify that you wished to add some packs to your CodeQL analysis. However, no packs were specified. Please either remove the '+' or specify some packs."
-        )
+          "A '+' was used in the 'packs' input to specify that you wished to add some packs to your CodeQL analysis. However, no packs were specified. Please either remove the '+' or specify some packs.",
+        ),
       );
     }
   }
@@ -1509,10 +1554,10 @@ function parsePacksFromInput(
  */
 export function parsePacksSpecification(
   packStr: string,
-  configFile?: string
+  configFile?: string,
 ): Pack {
   if (typeof packStr !== "string") {
-    throw new Error(getPacksStrInvalid(packStr, configFile));
+    throw new UserError(getPacksStrInvalid(packStr, configFile));
   }
 
   packStr = packStr.trim();
@@ -1524,7 +1569,7 @@ export function parsePacksSpecification(
   const packEnd = Math.min(
     atIndex > 0 ? atIndex : Infinity,
     colonIndex > 0 ? colonIndex : Infinity,
-    packStr.length
+    packStr.length,
   );
   const versionEnd = versionStart
     ? Math.min(colonIndex > 0 ? colonIndex : Infinity, packStr.length)
@@ -1540,14 +1585,14 @@ export function parsePacksSpecification(
     : undefined;
 
   if (!PACK_IDENTIFIER_PATTERN.test(packName)) {
-    throw new Error(getPacksStrInvalid(packStr, configFile));
+    throw new UserError(getPacksStrInvalid(packStr, configFile));
   }
   if (version) {
     try {
       new semver.Range(version);
     } catch (e) {
       // The range string is invalid. OK to ignore the caught error
-      throw new Error(getPacksStrInvalid(packStr, configFile));
+      throw new UserError(getPacksStrInvalid(packStr, configFile));
     }
   }
 
@@ -1561,12 +1606,12 @@ export function parsePacksSpecification(
       path.normalize(packPath).split(path.sep).join("/") !==
         packPath.split(path.sep).join("/"))
   ) {
-    throw new Error(getPacksStrInvalid(packStr, configFile));
+    throw new UserError(getPacksStrInvalid(packStr, configFile));
   }
 
   if (!packPath && pathStart) {
     // 0 length path
-    throw new Error(getPacksStrInvalid(packStr, configFile));
+    throw new UserError(getPacksStrInvalid(packStr, configFile));
   }
 
   return {
@@ -1574,12 +1619,6 @@ export function parsePacksSpecification(
     version,
     path: packPath,
   };
-}
-
-export function prettyPrintPack(pack: Pack) {
-  return `${pack.name}${pack.version ? `@${pack.version}` : ""}${
-    pack.path ? `:${pack.path}` : ""
-  }`;
 }
 
 export function validatePackSpecification(pack: string, configFile?: string) {
@@ -1593,26 +1632,26 @@ export function parsePacks(
   packsInputCombines: boolean,
   languages: Language[],
   configFile: string,
-  logger: Logger
+  logger: Logger,
 ): Packs {
   const packsFomConfig = parsePacksFromConfig(
     rawPacksFromConfig,
     languages,
     configFile,
-    logger
+    logger,
   );
 
   const packsFromInput = parsePacksFromInput(
     rawPacksFromInput,
     languages,
-    packsInputCombines
+    packsInputCombines,
   );
   if (!packsFromInput) {
     return packsFomConfig;
   }
   if (!packsInputCombines) {
     if (!packsFromInput) {
-      throw new Error(getPacksInvalid(configFile));
+      throw new UserError(getPacksInvalid(configFile));
     }
     return packsFromInput;
   }
@@ -1627,7 +1666,8 @@ export function parsePacks(
  * Without a '+', an input value will override the corresponding value in the config file.
  *
  * @param inputValue The input value to process.
- * @returns true if the input value should replace the corresponding value in the config file, false if it should be appended.
+ * @returns true if the input value should replace the corresponding value in the config file,
+ *          false if it should be appended.
  */
 function shouldCombine(inputValue?: string): boolean {
   return !!inputValue?.trim().startsWith("+");
@@ -1646,9 +1686,51 @@ function combinePacks(packs1: Packs, packs2: Packs): Packs {
   return packs;
 }
 
+/**
+ * Get information about ML-powered JS queries to populate status reports with.
+ *
+ * This will be:
+ *
+ * - The version string if the analysis is using a single version of the ML-powered query pack.
+ * - "latest" if the version string of the ML-powered query pack is undefined. This is unlikely to
+ *   occur in practice (see comment below).
+ * - "false" if the analysis won't run any ML-powered JS queries.
+ * - "other" in all other cases.
+ *
+ * Our goal of the status report here is to allow us to compare the occurrence of timeouts and other
+ * errors with ML-powered queries turned on and off. We also want to be able to compare minor
+ * version bumps caused by us bumping the version range of `ML_POWERED_JS_QUERIES_PACK` in a new
+ * version of the CodeQL Action. For instance, we might want to compare the `~0.1.0` and `~0.0.2`
+ * version strings.
+ *
+ * This function lives here rather than in `init-action.ts` so it's easier to test, since tests for
+ * `init-action.ts` would each need to live in their own file. See `analyze-action-env.ts` for an
+ * explanation as to why this is.
+ */
+export function getMlPoweredJsQueriesStatus(config: Config): string {
+  const mlPoweredJsQueryPacks = (config.packs.javascript || [])
+    .map((p) => parsePacksSpecification(p))
+    .filter(
+      (pack) => pack.name === ML_POWERED_JS_QUERIES_PACK_NAME && !pack.path,
+    );
+  switch (mlPoweredJsQueryPacks.length) {
+    case 1:
+      // We should always specify an explicit version string in `getMlPoweredJsQueriesPack`,
+      // otherwise we won't be able to make changes to the pack unless those changes are compatible
+      // with each version of the CodeQL Action. Therefore in practice we should only hit the
+      // `latest` case here when customers have explicitly added the ML-powered query pack to their
+      // CodeQL config.
+      return mlPoweredJsQueryPacks[0].version || "latest";
+    case 0:
+      return "false";
+    default:
+      return "other";
+  }
+}
+
 function dbLocationOrDefault(
   dbLocation: string | undefined,
-  tempDir: string
+  tempDir: string,
 ): string {
   return dbLocation || path.resolve(tempDir, "codeql_databases");
 }
@@ -1666,6 +1748,7 @@ export async function initConfig(
   registriesInput: string | undefined,
   configFile: string | undefined,
   dbLocation: string | undefined,
+  configInput: string | undefined,
   trapCachingEnabled: boolean,
   debugMode: boolean,
   debugArtifactName: string,
@@ -1676,10 +1759,22 @@ export async function initConfig(
   workspacePath: string,
   gitHubVersion: GitHubVersion,
   apiDetails: api.GitHubApiCombinedDetails,
-  featureEnablement: FeatureEnablement,
-  logger: Logger
+  features: FeatureEnablement,
+  logger: Logger,
 ): Promise<Config> {
   let config: Config;
+
+  // if configInput is set, it takes precedence over configFile
+  if (configInput) {
+    if (configFile) {
+      logger.warning(
+        `Both a config file and config input were provided. Ignoring config file.`,
+      );
+    }
+    configFile = path.resolve(workspacePath, "user-config-from-action.yml");
+    fs.writeFileSync(configFile, configInput);
+    logger.debug(`Using config from action input: ${configFile}`);
+  }
 
   // If no config file was provided create an empty one
   if (!configFile) {
@@ -1699,8 +1794,8 @@ export async function initConfig(
       workspacePath,
       gitHubVersion,
       apiDetails,
-      featureEnablement,
-      logger
+      features,
+      logger,
     );
   } else {
     config = await loadConfig(
@@ -1719,40 +1814,40 @@ export async function initConfig(
       workspacePath,
       gitHubVersion,
       apiDetails,
-      featureEnablement,
-      logger
+      features,
+      logger,
     );
-  }
-
-  // The list of queries should not be empty for any language. If it is then
-  // it is a user configuration error.
-  for (const language of config.languages) {
-    const hasBuiltinQueries = config.queries[language]?.builtin.length > 0;
-    const hasCustomQueries = config.queries[language]?.custom.length > 0;
-    const hasPacks = (config.packs[language]?.length || 0) > 0;
-    if (!hasPacks && !hasBuiltinQueries && !hasCustomQueries) {
-      throw new Error(
-        `Did not detect any queries to run for ${language}. ` +
-          "Please make sure that the default queries are enabled, or you are specifying queries to run."
-      );
-    }
   }
 
   // When using the codescanning config in the CLI, pack downloads
   // happen in the CLI during the `database init` command, so no need
   // to download them here.
-  await logCodeScanningConfigInCli(codeQL, featureEnablement, logger);
+  await logCodeScanningConfigInCli(codeQL, features, logger);
 
-  if (!(await useCodeScanningConfigInCli(codeQL, featureEnablement))) {
-    const registries = parseRegistries(registriesInput);
+  if (!(await useCodeScanningConfigInCli(codeQL, features))) {
+    // The list of queries should not be empty for any language. If it is then
+    // it is a user configuration error.
+    // This check occurs in the CLI when it parses the config file.
+    for (const language of config.languages) {
+      const hasBuiltinQueries = config.queries[language]?.builtin.length > 0;
+      const hasCustomQueries = config.queries[language]?.custom.length > 0;
+      const hasPacks = (config.packs[language]?.length || 0) > 0;
+      if (!hasPacks && !hasBuiltinQueries && !hasCustomQueries) {
+        throw new UserError(
+          `Did not detect any queries to run for ${language}. ` +
+            "Please make sure that the default queries are enabled, or you are specifying queries to run.",
+        );
+      }
+    }
+
     await downloadPacks(
       codeQL,
       config.languages,
       config.packs,
-      registries,
       apiDetails,
+      registriesInput,
       config.tempDir,
-      logger
+      logger,
     );
   }
 
@@ -1762,14 +1857,14 @@ export async function initConfig(
 }
 
 function parseRegistries(
-  registriesInput: string | undefined
+  registriesInput: string | undefined,
 ): RegistryConfigWithCredentials[] | undefined {
   try {
     return registriesInput
       ? (yaml.load(registriesInput) as RegistryConfigWithCredentials[])
       : undefined;
   } catch (e) {
-    throw new Error("Invalid registries input. Must be a YAML string.");
+    throw new UserError("Invalid registries input. Must be a YAML string.");
   }
 }
 
@@ -1785,12 +1880,12 @@ function isLocal(configPath: string): boolean {
 function getLocalConfig(configFile: string, workspacePath: string): UserConfig {
   // Error if the config file is now outside of the workspace
   if (!(configFile + path.sep).startsWith(workspacePath + path.sep)) {
-    throw new Error(getConfigFileOutsideWorkspaceErrorMessage(configFile));
+    throw new UserError(getConfigFileOutsideWorkspaceErrorMessage(configFile));
   }
 
   // Error if the file does not exist
   if (!fs.existsSync(configFile)) {
-    throw new Error(getConfigFileDoesNotExistErrorMessage(configFile));
+    throw new UserError(getConfigFileDoesNotExistErrorMessage(configFile));
   }
 
   return yaml.load(fs.readFileSync(configFile, "utf8")) as UserConfig;
@@ -1798,21 +1893,21 @@ function getLocalConfig(configFile: string, workspacePath: string): UserConfig {
 
 async function getRemoteConfig(
   configFile: string,
-  apiDetails: api.GitHubApiCombinedDetails
+  apiDetails: api.GitHubApiCombinedDetails,
 ): Promise<UserConfig> {
   // retrieve the various parts of the config location, and ensure they're present
   const format = new RegExp(
-    "(?<owner>[^/]+)/(?<repo>[^/]+)/(?<path>[^@]+)@(?<ref>.*)"
+    "(?<owner>[^/]+)/(?<repo>[^/]+)/(?<path>[^@]+)@(?<ref>.*)",
   );
   const pieces = format.exec(configFile);
   // 5 = 4 groups + the whole expression
   if (pieces === null || pieces.groups === undefined || pieces.length < 5) {
-    throw new Error(getConfigFileRepoFormatInvalidMessage(configFile));
+    throw new UserError(getConfigFileRepoFormatInvalidMessage(configFile));
   }
 
   const response = await api
     .getApiClientWithExternalAuth(apiDetails)
-    .repos.getContent({
+    .rest.repos.getContent({
       owner: pieces.groups.owner,
       repo: pieces.groups.repo,
       path: pieces.groups.path,
@@ -1823,13 +1918,13 @@ async function getRemoteConfig(
   if ("content" in response.data && response.data.content !== undefined) {
     fileContents = response.data.content;
   } else if (Array.isArray(response.data)) {
-    throw new Error(getConfigFileDirectoryGivenMessage(configFile));
+    throw new UserError(getConfigFileDirectoryGivenMessage(configFile));
   } else {
-    throw new Error(getConfigFileFormatInvalidMessage(configFile));
+    throw new UserError(getConfigFileFormatInvalidMessage(configFile));
   }
 
   return yaml.load(
-    Buffer.from(fileContents, "base64").toString("binary")
+    Buffer.from(fileContents, "base64").toString("binary"),
   ) as UserConfig;
 }
 
@@ -1858,7 +1953,7 @@ async function saveConfig(config: Config, logger: Logger) {
  */
 export async function getConfig(
   tempDir: string,
-  logger: Logger
+  logger: Logger,
 ): Promise<Config | undefined> {
   const configFile = getPathToParsedConfigFile(tempDir);
   if (!fs.existsSync(configFile)) {
@@ -1874,32 +1969,18 @@ export async function downloadPacks(
   codeQL: CodeQL,
   languages: Language[],
   packs: Packs,
-  registries: RegistryConfigWithCredentials[] | undefined,
   apiDetails: api.GitHubApiDetails,
-  tmpDir: string,
-  logger: Logger
+  registriesInput: string | undefined,
+  tempDir: string,
+  logger: Logger,
 ) {
-  let qlconfigFile: string | undefined;
-  let registriesAuthTokens: string | undefined;
-  if (registries) {
-    if (
-      !(await codeQlVersionAbove(codeQL, CODEQL_VERSION_GHES_PACK_DOWNLOAD))
-    ) {
-      throw new Error(
-        `'registries' input is not supported on CodeQL versions less than ${CODEQL_VERSION_GHES_PACK_DOWNLOAD}.`
-      );
-    }
-
-    // generate a qlconfig.yml file to hold the registry configs.
-    const qlconfig = createRegistriesBlock(registries);
-    qlconfigFile = path.join(tmpDir, "qlconfig.yml");
-    fs.writeFileSync(qlconfigFile, yaml.dump(qlconfig), "utf8");
-
-    registriesAuthTokens = registries
-      .map((registry) => `${registry.url}=${registry.token}`)
-      .join(",");
-  }
-
+  // This code path is only used when config parsing occurs in the Action.
+  const { registriesAuthTokens, qlconfigFile } = await generateRegistries(
+    registriesInput,
+    codeQL,
+    tempDir,
+    logger,
+  );
   await wrapEnvironment(
     {
       GITHUB_TOKEN: apiDetails.auth,
@@ -1914,26 +1995,85 @@ export async function downloadPacks(
           logger.info(`Downloading custom packs for ${language}`);
           const results = await codeQL.packDownload(
             packsWithVersion,
-            qlconfigFile
+            qlconfigFile,
           );
           numPacksDownloaded += results.packs.length;
           logger.info(
             `Downloaded: ${results.packs
               .map((r) => `${r.name}@${r.version || "latest"}`)
-              .join(", ")}`
+              .join(", ")}`,
           );
         }
       }
       if (numPacksDownloaded > 0) {
         logger.info(
-          `Downloaded ${numPacksDownloaded} ${packs === 1 ? "pack" : "packs"}`
+          `Downloaded ${numPacksDownloaded} ${
+            numPacksDownloaded === 1 ? "pack" : "packs"
+          }`,
         );
       } else {
         logger.info("No packs to download");
       }
       logger.endGroup();
-    }
+    },
   );
+}
+
+/**
+ * Generate a `qlconfig.yml` file from the `registries` input.
+ * This file is used by the CodeQL CLI to list the registries to use for each
+ * pack.
+ *
+ * @param registriesInput The value of the `registries` input.
+ * @param codeQL a codeQL object, used only for checking the version of CodeQL.
+ * @param tempDir a temporary directory to store the generated qlconfig.yml file.
+ * @param logger a logger object.
+ * @returns The path to the generated `qlconfig.yml` file and the auth tokens to
+ *        use for each registry.
+ */
+export async function generateRegistries(
+  registriesInput: string | undefined,
+  codeQL: CodeQL,
+  tempDir: string,
+  logger: Logger,
+) {
+  const registries = parseRegistries(registriesInput);
+  let registriesAuthTokens: string | undefined;
+  let qlconfigFile: string | undefined;
+  if (registries) {
+    if (
+      !(await codeQlVersionAbove(codeQL, CODEQL_VERSION_GHES_PACK_DOWNLOAD))
+    ) {
+      throw new UserError(
+        `The 'registries' input is not supported on CodeQL CLI versions earlier than ${CODEQL_VERSION_GHES_PACK_DOWNLOAD}. Please upgrade to CodeQL CLI version ${CODEQL_VERSION_GHES_PACK_DOWNLOAD} or later.`,
+      );
+    }
+
+    // generate a qlconfig.yml file to hold the registry configs.
+    const qlconfig = createRegistriesBlock(registries);
+    qlconfigFile = path.join(tempDir, "qlconfig.yml");
+    const qlconfigContents = yaml.dump(qlconfig);
+    fs.writeFileSync(qlconfigFile, qlconfigContents, "utf8");
+
+    logger.debug("Generated qlconfig.yml:");
+    logger.debug(qlconfigContents);
+    registriesAuthTokens = registries
+      .map((registry) => `${registry.url}=${registry.token}`)
+      .join(",");
+  }
+
+  if (typeof process.env.CODEQL_REGISTRIES_AUTH === "string") {
+    logger.debug(
+      "Using CODEQL_REGISTRIES_AUTH environment variable to authenticate with registries.",
+    );
+  }
+
+  return {
+    registriesAuthTokens:
+      // if the user has explicitly set the CODEQL_REGISTRIES_AUTH env var then use that
+      process.env.CODEQL_REGISTRIES_AUTH ?? registriesAuthTokens,
+    qlconfigFile,
+  };
 }
 
 function createRegistriesBlock(registries: RegistryConfigWithCredentials[]): {
@@ -1943,8 +2083,8 @@ function createRegistriesBlock(registries: RegistryConfigWithCredentials[]): {
     !Array.isArray(registries) ||
     registries.some((r) => !r.url || !r.packages)
   ) {
-    throw new Error(
-      "Invalid 'registries' input. Must be an array of objects with 'url' and 'packages' properties."
+    throw new UserError(
+      "Invalid 'registries' input. Must be an array of objects with 'url' and 'packages' properties.",
     );
   }
 
@@ -1972,9 +2112,9 @@ function createRegistriesBlock(registries: RegistryConfigWithCredentials[]): {
  * @param env
  * @param operation
  */
-async function wrapEnvironment(
+export async function wrapEnvironment(
   env: Record<string, string | undefined>,
-  operation: Function
+  operation: Function,
 ) {
   // Remember the original env
   const oldEnv = { ...process.env };

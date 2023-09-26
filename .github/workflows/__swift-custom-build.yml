@@ -1,17 +1,17 @@
 # Warning: This file is generated automatically, and should not be modified.
 # Instead, please modify the template in the pr-checks directory and run:
-#     pip install ruamel.yaml && python3 sync.py
+#     (cd pr-checks; pip install ruamel.yaml@0.17.31 && python3 sync.py)
 # to regenerate this file.
 
 name: PR Check - Swift analysis using a custom build command
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
+  CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN: 'true'
 on:
   push:
     branches:
     - main
-    - releases/v1
     - releases/v2
   pull_request:
     types:
@@ -30,38 +30,54 @@ jobs:
         - os: macos-latest
           version: latest
         - os: ubuntu-latest
-          version: cached
+          version: default
         - os: macos-latest
-          version: cached
+          version: default
         - os: ubuntu-latest
           version: nightly-latest
         - os: macos-latest
           version: nightly-latest
     name: Swift analysis using a custom build command
+    permissions:
+      contents: read
+      security-events: write
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
     - name: Check out repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     - name: Prepare test
       id: prepare-test
-      uses: ./.github/prepare-test
+      uses: ./.github/actions/prepare-test
       with:
         version: ${{ matrix.version }}
-    - uses: swift-actions/setup-swift@5cdaa9161ad1f55ae39a5ea1784ef96de72f95d9
-    # Only macOS latest and nightly-latest support Swift 5.7.1
-      if: runner.os == 'Linux' || matrix.version == 'cached'
-      with:
-        swift-version: '5.7'
+        use-all-platform-bundle: 'false'
+    - name: Set environment variable for Swift enablement
+      if: >-
+        runner.os != 'Windows' && (
+            matrix.version == '20220908' ||
+            matrix.version == '20221211'
+        )
+      shell: bash
+      run: echo "CODEQL_ENABLE_EXPERIMENTAL_FEATURES_SWIFT=true" >> $GITHUB_ENV
     - uses: ./../action/init
+      id: init
       with:
         languages: swift
         tools: ${{ steps.prepare-test.outputs.tools-url }}
+    - uses: ./../action/.github/actions/setup-swift
+      with:
+        codeql-path: ${{steps.init.outputs.codeql-path}}
+    - name: Check working directory
+      shell: bash
+      run: pwd
     - name: Build code
       shell: bash
       run: ./build.sh
     - uses: ./../action/analyze
       id: analysis
+      with:
+        upload-database: false
     - name: Check database
       shell: bash
       run: |
@@ -71,6 +87,5 @@ jobs:
           exit 1
         fi
     env:
-      CODEQL_ENABLE_EXPERIMENTAL_FEATURES_SWIFT: 'true'
       DOTNET_GENERATE_ASPNET_CERTIFICATE: 'false'
       CODEQL_ACTION_TEST_MODE: true

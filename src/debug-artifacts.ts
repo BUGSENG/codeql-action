@@ -8,13 +8,12 @@ import del from "del";
 
 import { getRequiredInput } from "./actions-util";
 import { dbIsFinalized } from "./analyze";
-import { CODEQL_VERSION_NEW_TRACING, getCodeQL } from "./codeql";
+import { getCodeQL } from "./codeql";
 import { Config } from "./config-utils";
 import { Language } from "./languages";
 import { Logger } from "./logging";
 import {
   bundleDb,
-  codeQlVersionAbove,
   doesDirectoryExist,
   getCodeQLDatabasePath,
   listFolder,
@@ -27,7 +26,7 @@ export function sanitizeArifactName(name: string): string {
 export async function uploadDebugArtifacts(
   toUpload: string[],
   rootDir: string,
-  artifactName: string
+  artifactName: string,
 ) {
   if (toUpload.length === 0) {
     return;
@@ -36,24 +35,27 @@ export async function uploadDebugArtifacts(
   const matrix = getRequiredInput("matrix");
   if (matrix) {
     try {
-      for (const [, matrixVal] of Object.entries(JSON.parse(matrix)).sort())
+      for (const [, matrixVal] of Object.entries(
+        JSON.parse(matrix) as any[][],
+      ).sort())
         suffix += `-${matrixVal}`;
     } catch (e) {
       core.info(
-        "Could not parse user-specified `matrix` input into JSON. The debug artifact will not be named with the user's `matrix` input."
+        "Could not parse user-specified `matrix` input into JSON. The debug artifact will not be named with the user's `matrix` input.",
       );
     }
   }
   await artifact.create().uploadArtifact(
     sanitizeArifactName(`${artifactName}${suffix}`),
     toUpload.map((file) => path.normalize(file)),
-    path.normalize(rootDir)
+    path.normalize(rootDir),
+    { continueOnError: true },
   );
 }
 
 export async function uploadSarifDebugArtifact(
   config: Config,
-  outputDir: string
+  outputDir: string,
 ) {
   if (!doesDirectoryExist(outputDir)) {
     return;
@@ -70,8 +72,6 @@ export async function uploadSarifDebugArtifact(
 }
 
 export async function uploadLogsDebugArtifact(config: Config) {
-  const codeql = await getCodeQL(config.codeQLCmd);
-
   let toUpload: string[] = [];
   for (const language of config.languages) {
     const databaseDirectory = getCodeQLDatabasePath(config, language);
@@ -81,36 +81,20 @@ export async function uploadLogsDebugArtifact(config: Config) {
     }
   }
 
-  if (await codeQlVersionAbove(codeql, CODEQL_VERSION_NEW_TRACING)) {
-    // Multilanguage tracing: there are additional logs in the root of the cluster
-    const multiLanguageTracingLogsDirectory = path.resolve(
-      config.dbLocation,
-      "log"
-    );
-    if (doesDirectoryExist(multiLanguageTracingLogsDirectory)) {
-      toUpload = toUpload.concat(listFolder(multiLanguageTracingLogsDirectory));
-    }
+  // Multilanguage tracing: there are additional logs in the root of the cluster
+  const multiLanguageTracingLogsDirectory = path.resolve(
+    config.dbLocation,
+    "log",
+  );
+  if (doesDirectoryExist(multiLanguageTracingLogsDirectory)) {
+    toUpload = toUpload.concat(listFolder(multiLanguageTracingLogsDirectory));
   }
+
   await uploadDebugArtifacts(
     toUpload,
     config.dbLocation,
-    config.debugArtifactName
+    config.debugArtifactName,
   );
-
-  // Before multi-language tracing, we wrote a compound-build-tracer.log in the temp dir
-  if (!(await codeQlVersionAbove(codeql, CODEQL_VERSION_NEW_TRACING))) {
-    const compoundBuildTracerLogDirectory = path.resolve(
-      config.tempDir,
-      "compound-build-tracer.log"
-    );
-    if (doesDirectoryExist(compoundBuildTracerLogDirectory)) {
-      await uploadDebugArtifacts(
-        [compoundBuildTracerLogDirectory],
-        config.tempDir,
-        config.debugArtifactName
-      );
-    }
-  }
 }
 
 /**
@@ -120,15 +104,15 @@ export async function uploadLogsDebugArtifact(config: Config) {
  */
 async function createPartialDatabaseBundle(
   config: Config,
-  language: Language
+  language: Language,
 ): Promise<string> {
   const databasePath = getCodeQLDatabasePath(config, language);
   const databaseBundlePath = path.resolve(
     config.dbLocation,
-    `${config.debugDatabaseName}-${language}-partial.zip`
+    `${config.debugDatabaseName}-${language}-partial.zip`,
   );
   core.info(
-    `${config.debugDatabaseName}-${language} is not finalized. Uploading partial database bundle at ${databaseBundlePath}...`
+    `${config.debugDatabaseName}-${language} is not finalized. Uploading partial database bundle at ${databaseBundlePath}...`,
   );
   // See `bundleDb` for explanation behind deleting existing db bundle.
   if (fs.existsSync(databaseBundlePath)) {
@@ -145,29 +129,29 @@ async function createPartialDatabaseBundle(
  */
 async function createDatabaseBundleCli(
   config: Config,
-  language: Language
+  language: Language,
 ): Promise<string> {
   // Otherwise run `codeql database bundle` command.
   const databaseBundlePath = await bundleDb(
     config,
     language,
     await getCodeQL(config.codeQLCmd),
-    `${config.debugDatabaseName}-${language}`
+    `${config.debugDatabaseName}-${language}`,
   );
   return databaseBundlePath;
 }
 
 export async function uploadDatabaseBundleDebugArtifact(
   config: Config,
-  logger: Logger
+  logger: Logger,
 ) {
   for (const language of config.languages) {
     try {
-      let databaseBundlePath;
+      let databaseBundlePath: string;
       if (!dbIsFinalized(config, language, logger)) {
         databaseBundlePath = await createPartialDatabaseBundle(
           config,
-          language
+          language,
         );
       } else {
         databaseBundlePath = await createDatabaseBundleCli(config, language);
@@ -175,11 +159,11 @@ export async function uploadDatabaseBundleDebugArtifact(
       await uploadDebugArtifacts(
         [databaseBundlePath],
         config.dbLocation,
-        config.debugArtifactName
+        config.debugArtifactName,
       );
     } catch (error) {
       core.info(
-        `Failed to upload database debug bundle for ${config.debugDatabaseName}-${language}: ${error}`
+        `Failed to upload database debug bundle for ${config.debugDatabaseName}-${language}: ${error}`,
       );
     }
   }

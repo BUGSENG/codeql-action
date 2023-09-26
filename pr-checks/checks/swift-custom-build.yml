@@ -1,25 +1,28 @@
 name: "Swift analysis using a custom build command"
 description: "Tests creation of a Swift database using custom build"
-versions: ["latest", "cached", "nightly-latest"]
+versions: ["latest", "default", "nightly-latest"]
 operatingSystems: ["ubuntu", "macos"]
 env:
-  CODEQL_ENABLE_EXPERIMENTAL_FEATURES_SWIFT: "true"
   DOTNET_GENERATE_ASPNET_CERTIFICATE: "false"
 steps:
-  - uses: swift-actions/setup-swift@5cdaa9161ad1f55ae39a5ea1784ef96de72f95d9
-    # Only macOS latest and nightly-latest support Swift 5.7.1
-    if: runner.os == 'Linux' || matrix.version == 'cached'
-    with:
-      swift-version: "5.7"
   - uses: ./../action/init
+    id: init
     with:
       languages: swift
       tools: ${{ steps.prepare-test.outputs.tools-url }}
+  - uses: ./../action/.github/actions/setup-swift
+    with:
+      codeql-path: ${{steps.init.outputs.codeql-path}}
+  - name: Check working directory
+    shell: bash
+    run: pwd
   - name: Build code
     shell: bash
     run: ./build.sh
   - uses: ./../action/analyze
     id: analysis
+    with:
+      upload-database: false
   - name: Check database
     shell: bash
     run: |

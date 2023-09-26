@@ -18,14 +18,14 @@ test.beforeEach(() => {
 test("validateSarifFileSchema - valid", (t) => {
   const inputFile = `${__dirname}/../src/testdata/valid-sarif.sarif`;
   t.notThrows(() =>
-    uploadLib.validateSarifFileSchema(inputFile, getRunnerLogger(true))
+    uploadLib.validateSarifFileSchema(inputFile, getRunnerLogger(true)),
   );
 });
 
 test("validateSarifFileSchema - invalid", (t) => {
   const inputFile = `${__dirname}/../src/testdata/invalid-sarif.sarif`;
   t.throws(() =>
-    uploadLib.validateSarifFileSchema(inputFile, getRunnerLogger(true))
+    uploadLib.validateSarifFileSchema(inputFile, getRunnerLogger(true)),
   );
 });
 
@@ -37,11 +37,12 @@ test("validate correct payload used for push, PR merge commit, and PR head", asy
     "key",
     undefined,
     "",
-    undefined,
+    1234,
+    1,
     "/opt/src",
     undefined,
     ["CodeQL", "eslint"],
-    "mergeBaseCommit"
+    "mergeBaseCommit",
   );
   // Not triggered by a pull request
   t.falsy(pushPayload.base_ref);
@@ -59,11 +60,12 @@ test("validate correct payload used for push, PR merge commit, and PR head", asy
     "key",
     undefined,
     "",
-    undefined,
+    1234,
+    1,
     "/opt/src",
     undefined,
     ["CodeQL", "eslint"],
-    "mergeBaseCommit"
+    "mergeBaseCommit",
   );
   // Uploads for a merge commit use the merge base
   t.deepEqual(prMergePayload.base_ref, "refs/heads/master");
@@ -75,17 +77,18 @@ test("validate correct payload used for push, PR merge commit, and PR head", asy
     "key",
     undefined,
     "",
-    undefined,
+    1234,
+    1,
     "/opt/src",
     undefined,
     ["CodeQL", "eslint"],
-    "mergeBaseCommit"
+    "mergeBaseCommit",
   );
   // Uploads for the head use the PR base
   t.deepEqual(prHeadPayload.base_ref, "refs/heads/master");
   t.deepEqual(
     prHeadPayload.base_sha,
-    "f95f852bd8fca8fcc58a9a2d6c842781e32a215e"
+    "f95f852bd8fca8fcc58a9a2d6c842781e32a215e",
   );
 });
 
@@ -110,7 +113,7 @@ test("finding SARIF files", async (t) => {
     fs.symlinkSync(
       path.join(tmpDir, "a.sarif"),
       path.join(tmpDir, "dir3", "symlink2.sarif"),
-      "file"
+      "file",
     );
 
     const sarifFiles = uploadLib.findSarifFilesInDir(tmpDir);
@@ -139,7 +142,7 @@ test("populateRunAutomationDetails", (t) => {
     sarif,
     "language:javascript/os:linux",
     analysisKey,
-    '{"language": "other", "os": "other"}'
+    '{"language": "other", "os": "other"}',
   );
   t.deepEqual(modifiedSarif, expectedSarif);
 
@@ -148,7 +151,7 @@ test("populateRunAutomationDetails", (t) => {
     sarif,
     "language:javascript/os:linux/",
     analysisKey,
-    ""
+    "",
   );
   t.deepEqual(modifiedSarif, expectedSarif);
 
@@ -159,7 +162,7 @@ test("populateRunAutomationDetails", (t) => {
     sarif,
     undefined,
     analysisKey,
-    '{"os": "linux", "language": "javascript"}'
+    '{"os": "linux", "language": "javascript"}',
   );
   t.deepEqual(modifiedSarif, expectedSarif);
 
@@ -179,7 +182,7 @@ test("populateRunAutomationDetails", (t) => {
     sarif,
     undefined,
     analysisKey,
-    '{"os": "linux", "language": "javascript"}'
+    '{"os": "linux", "language": "javascript"}',
   );
   t.deepEqual(modifiedSarif, expectedSarif);
 });
@@ -200,7 +203,7 @@ test("validateUniqueCategory for automation details id", (t) => {
   // Our category sanitization is not perfect. Here are some examples
   // of where we see false clashes
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc/def"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc/def")),
   );
   t.throws(() => uploadLib.validateUniqueCategory(createMockSarif("abc@def")));
   t.throws(() => uploadLib.validateUniqueCategory(createMockSarif("abc_def")));
@@ -208,69 +211,69 @@ test("validateUniqueCategory for automation details id", (t) => {
 
   // this one is fine
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc_ def"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc_ def")),
   );
 });
 
 test("validateUniqueCategory for tool name", (t) => {
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "AbC"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "AbC")),
   );
 
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "def"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "def")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "def"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "def")),
   );
 
   // Our category sanitization is not perfect. Here are some examples
   // of where we see false clashes
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc/def"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc/def")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc@def"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc@def")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc_def"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc_def")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc def"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc def")),
   );
 
   // this one is fine
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc_ def"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc_ def")),
   );
 });
 
 test("validateUniqueCategory for automation details id and tool name", (t) => {
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc", "abc"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc", "abc")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc", "abc"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc", "abc")),
   );
 
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc_", "def"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc_", "def")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc_", "def"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc_", "def")),
   );
 
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("ghi", "_jkl"))
+    uploadLib.validateUniqueCategory(createMockSarif("ghi", "_jkl")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("ghi", "_jkl"))
+    uploadLib.validateUniqueCategory(createMockSarif("ghi", "_jkl")),
   );
 
   // Our category sanitization is not perfect. Here are some examples
@@ -279,15 +282,15 @@ test("validateUniqueCategory for automation details id and tool name", (t) => {
   t.throws(() => uploadLib.validateUniqueCategory(createMockSarif("abc", "_")));
 
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc", "def__"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc", "def__")),
   );
   t.throws(() => uploadLib.validateUniqueCategory(createMockSarif("abc_def")));
 
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("mno_", "pqr"))
+    uploadLib.validateUniqueCategory(createMockSarif("mno_", "pqr")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("mno", "_pqr"))
+    uploadLib.validateUniqueCategory(createMockSarif("mno", "_pqr")),
   );
 });
 
@@ -357,6 +360,23 @@ test("pruneInvalidResults", (t) => {
   t.assert(loggedMessages[0].includes("Pruned 2 results"));
 });
 
+test("accept results with invalid artifactLocation.uri value", (t) => {
+  const loggedMessages: string[] = [];
+  const mockLogger = {
+    info: (message: string) => {
+      loggedMessages.push(message);
+    },
+  } as Logger;
+
+  const sarifFile = `${__dirname}/../src/testdata/with-invalid-uri.sarif`;
+  uploadLib.validateSarifFileSchema(sarifFile, mockLogger);
+
+  t.deepEqual(loggedMessages.length, 1);
+  t.deepEqual(
+    loggedMessages[0],
+    "Warning: 'not a valid URI' is not a valid URI in 'instance.runs[0].results[0].locations[0].physicalLocation.artifactLocation.uri'.",
+  );
+});
 const affectedCodeQLVersion = {
   driver: {
     name: "CodeQL",

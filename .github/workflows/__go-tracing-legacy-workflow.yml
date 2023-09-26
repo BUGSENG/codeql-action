@@ -1,17 +1,17 @@
 # Warning: This file is generated automatically, and should not be modified.
 # Instead, please modify the template in the pr-checks directory and run:
-#     pip install ruamel.yaml && python3 sync.py
+#     (cd pr-checks; pip install ruamel.yaml@0.17.31 && python3 sync.py)
 # to regenerate this file.
 
 name: 'PR Check - Go: tracing with legacy workflow'
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
+  CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN: 'true'
 on:
   push:
     branches:
     - main
-    - releases/v1
     - releases/v2
   pull_request:
     types:
@@ -25,22 +25,26 @@ jobs:
     strategy:
       matrix:
         include:
-        - os: ubuntu-20.04
-          version: stable-20211005
-        - os: macos-latest
-          version: stable-20211005
-        - os: ubuntu-20.04
-          version: stable-20220120
-        - os: macos-latest
-          version: stable-20220120
         - os: ubuntu-latest
-          version: stable-20220401
+          version: stable-20220615
         - os: macos-latest
-          version: stable-20220401
+          version: stable-20220615
         - os: ubuntu-latest
-          version: cached
+          version: stable-20220908
         - os: macos-latest
-          version: cached
+          version: stable-20220908
+        - os: ubuntu-latest
+          version: stable-20221211
+        - os: macos-latest
+          version: stable-20221211
+        - os: ubuntu-latest
+          version: stable-20230418
+        - os: macos-latest
+          version: stable-20230418
+        - os: ubuntu-latest
+          version: default
+        - os: macos-latest
+          version: default
         - os: ubuntu-latest
           version: latest
         - os: macos-latest
@@ -50,26 +54,35 @@ jobs:
         - os: macos-latest
           version: nightly-latest
     name: 'Go: tracing with legacy workflow'
+    permissions:
+      contents: read
+      security-events: write
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
     - name: Check out repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     - name: Prepare test
       id: prepare-test
-      uses: ./.github/prepare-test
+      uses: ./.github/actions/prepare-test
       with:
         version: ${{ matrix.version }}
-    - name: Set up Go
-      if: matrix.os == 'ubuntu-20.04' || matrix.os == 'windows-2019'
-      uses: actions/setup-go@v3
-      with:
-        go-version: ^1.13.1
+        use-all-platform-bundle: 'false'
+    - name: Set environment variable for Swift enablement
+      if: >-
+        runner.os != 'Windows' && (
+            matrix.version == '20220908' ||
+            matrix.version == '20221211'
+        )
+      shell: bash
+      run: echo "CODEQL_ENABLE_EXPERIMENTAL_FEATURES_SWIFT=true" >> $GITHUB_ENV
     - uses: ./../action/init
       with:
         languages: go
         tools: ${{ steps.prepare-test.outputs.tools-url }}
     - uses: ./../action/analyze
+      with:
+        upload-database: false
     - shell: bash
       run: |
         cd "$RUNNER_TEMP/codeql_databases"

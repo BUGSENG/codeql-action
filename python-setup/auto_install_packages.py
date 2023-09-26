@@ -33,10 +33,17 @@ def _check_output(command, extra_env={}):
 
 def install_packages_with_poetry():
 
-    # To handle poetry 1.2, which started to use keyring interaction MUCH more, we need
-    # add a workaround. See
-    # https://github.com/python-poetry/poetry/issues/2692#issuecomment-1235683370
-    extra_poetry_env = {"PYTHON_KEYRING_BACKEND": "keyring.backends.null.Keyring"}
+    extra_poetry_env = {
+        # To handle poetry 1.2, which started to use keyring interaction MUCH more, we need
+        # add a workaround. See
+        # https://github.com/python-poetry/poetry/issues/2692#issuecomment-1235683370
+        "PYTHON_KEYRING_BACKEND": "keyring.backends.null.Keyring",
+        # Projects that specify `virtualenvs.in-project = true` in their poetry.toml
+        # would get the venv created inside the repo directory, which would cause CodeQL
+        # to consider it as user-written code. We don't want this to happen. see
+        # https://python-poetry.org/docs/configuration/#virtualenvsin-project
+        "POETRY_VIRTUALENVS_IN_PROJECT": "False",
+    }
 
     command = [sys.executable, '-m', 'poetry']
     if sys.platform.startswith('win32'):
@@ -69,7 +76,7 @@ def install_packages_with_pipenv(has_lockfile):
         # In windows the default path were the deps are installed gets wiped out between steps,
         # so we have to set it up to a folder that will be kept
         os.environ['WORKON_HOME'] = os.path.join(os.environ['RUNNER_WORKSPACE'], 'virtualenvs')
-    lock_args = ['--keep-outdated', '--ignore-pipfile'] if has_lockfile else ['--skip-lock']
+    lock_args = ['--ignore-pipfile'] if has_lockfile else ['--skip-lock']
     try:
         _check_call(command + ['install'] + lock_args)
     except subprocess.CalledProcessError:

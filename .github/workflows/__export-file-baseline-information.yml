@@ -1,17 +1,17 @@
 # Warning: This file is generated automatically, and should not be modified.
 # Instead, please modify the template in the pr-checks directory and run:
-#     pip install ruamel.yaml && python3 sync.py
+#     (cd pr-checks; pip install ruamel.yaml@0.17.31 && python3 sync.py)
 # to regenerate this file.
 
 name: PR Check - Export file baseline information
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
+  CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN: 'true'
 on:
   push:
     branches:
     - main
-    - releases/v1
     - releases/v2
   pull_request:
     types:
@@ -32,28 +32,38 @@ jobs:
         - os: windows-latest
           version: nightly-latest
     name: Export file baseline information
+    permissions:
+      contents: read
+      security-events: write
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
     - name: Check out repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     - name: Prepare test
       id: prepare-test
-      uses: ./.github/prepare-test
+      uses: ./.github/actions/prepare-test
       with:
         version: ${{ matrix.version }}
-    - uses: swift-actions/setup-swift@5cdaa9161ad1f55ae39a5ea1784ef96de72f95d9
-    # Windows doesn't support Swift, and only macOS latest and nightly-latest support Swift 5.7.1.
-      if: runner.os == 'Linux' || (runner.os == 'macOS' && matrix.version == 'cached')
-      with:
-        swift-version: '5.7'
+        use-all-platform-bundle: 'false'
+    - name: Set environment variable for Swift enablement
+      if: >-
+        runner.os != 'Windows' && (
+            matrix.version == '20220908' ||
+            matrix.version == '20221211'
+        )
+      shell: bash
+      run: echo "CODEQL_ENABLE_EXPERIMENTAL_FEATURES_SWIFT=true" >> $GITHUB_ENV
     - uses: ./../action/init
+      id: init
       with:
         languages: javascript
         tools: ${{ steps.prepare-test.outputs.tools-url }}
       env:
         CODEQL_FILE_BASELINE_INFORMATION: true
-        CODEQL_ENABLE_EXPERIMENTAL_FEATURES_SWIFT: true
+    - uses: ./../action/.github/actions/setup-swift
+      with:
+        codeql-path: ${{ steps.init.outputs.codeql-path }}
     - name: Build code
       shell: bash
       run: ./build.sh
@@ -62,7 +72,6 @@ jobs:
         output: ${{ runner.temp }}/results
       env:
         CODEQL_FILE_BASELINE_INFORMATION: true
-        CODEQL_ENABLE_EXPERIMENTAL_FEATURES_SWIFT: true
     - name: Upload SARIF
       uses: actions/upload-artifact@v3
       with:
@@ -73,7 +82,10 @@ jobs:
       shell: bash
       run: |
         cd "$RUNNER_TEMP/results"
-        expected_baseline_languages="cpp cs go java js py rb swift"
+        expected_baseline_languages="cpp cs go java js py rb"
+        if [[ $RUNNER_OS != "Windows" ]]; then
+          expected_baseline_languages+=" swift"
+        fi
 
         for lang in ${expected_baseline_languages}; do
           rule_name="${lang}/baseline/expected-extracted-files"

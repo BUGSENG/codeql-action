@@ -1,30 +1,31 @@
 import * as fs from "fs";
-import { OutgoingHttpHeaders } from "http";
 import * as path from "path";
 
+import * as core from "@actions/core";
 import * as toolrunner from "@actions/exec/lib/toolrunner";
-import * as toolcache from "@actions/tool-cache";
-import { default as deepEqual } from "fast-deep-equal";
 import * as yaml from "js-yaml";
-import { default as queryString } from "query-string";
-import * as semver from "semver";
-import { v4 as uuidV4 } from "uuid";
 
-import { isRunningLocalAction } from "./actions-util";
+import {
+  getActionVersion,
+  getOptionalInput,
+  isAnalyzingDefaultBranch,
+} from "./actions-util";
 import * as api from "./api-client";
-import { Config } from "./config-utils";
-import * as defaults from "./defaults.json"; // Referenced from codeql-action-sync-tool!
-import { errorMatchers } from "./error-matcher";
-import { Feature, FeatureEnablement } from "./feature-flags";
+import type { Config } from "./config-utils";
+import { EnvVar } from "./environment";
+import {
+  CODEQL_VERSION_INTRA_LAYER_PARALLELISM,
+  CODEQL_VERSION_ANALYSIS_SUMMARY_V2,
+  CodeQLDefaultVersionInfo,
+  Feature,
+  FeatureEnablement,
+  useCodeScanningConfigInCli,
+} from "./feature-flags";
 import { isTracedLanguage, Language } from "./languages";
 import { Logger } from "./logging";
-import { toolrunnerErrorCatcher } from "./toolrunner-error-catcher";
-import {
-  getTrapCachingExtractorConfigArgs,
-  getTrapCachingExtractorConfigArgsForLang,
-} from "./trap-caching";
+import * as setupCodeql from "./setup-codeql";
 import * as util from "./util";
-import { isGoodVersion } from "./util";
+import { wrapError } from "./util";
 
 type Options = Array<string | number | boolean>;
 
@@ -51,14 +52,16 @@ export class CommandInvocationError extends Error {
   constructor(
     cmd: string,
     args: string[],
-    exitCode: number,
-    error: string,
-    public output: string
+    public exitCode: number,
+    public error: string,
+    public output: string,
   ) {
+    const prettyCommand = [cmd, ...args]
+      .map((x) => (x.includes(" ") ? `'${x}'` : x))
+      .join(" ");
     super(
-      `Failure invoking ${cmd} with arguments ${args}.\n
-      Exit code ${exitCode} and error was:\n
-      ${error}`
+      `Encountered a fatal error while running "${prettyCommand}". ` +
+        `Exit code was ${exitCode} and error was: ${error.trim()}`,
     );
   }
 }
@@ -77,27 +80,15 @@ export interface CodeQL {
    */
   printVersion(): Promise<void>;
   /**
-   * Run 'codeql database trace-command' on 'tracer-env.js' and parse
-   * the result to get environment variables set by CodeQL.
-   */
-  getTracerEnv(databasePath: string): Promise<{ [key: string]: string }>;
-  /**
-   * Run 'codeql database init'.
-   */
-  databaseInit(
-    databasePath: string,
-    language: Language,
-    sourceRoot: string
-  ): Promise<void>;
-  /**
    * Run 'codeql database init --db-cluster'.
    */
   databaseInitCluster(
     config: Config,
     sourceRoot: string,
     processName: string | undefined,
-    featureEnablement: FeatureEnablement,
-    logger: Logger
+    features: FeatureEnablement,
+    qlconfigFile: string | undefined,
+    logger: Logger,
   ): Promise<void>;
   /**
    * Runs the autobuilder for the given language.
@@ -114,7 +105,7 @@ export interface CodeQL {
   finalizeDatabase(
     databasePath: string,
     threadsFlag: string,
-    memoryFlag: string
+    memoryFlag: string,
   ): Promise<void>;
   /**
    * Run 'codeql resolve languages'.
@@ -129,15 +120,22 @@ export interface CodeQL {
    */
   resolveQueries(
     queries: string[],
-    extraSearchPath: string | undefined
+    extraSearchPath: string | undefined,
   ): Promise<ResolveQueriesOutput>;
+  /**
+   * Run 'codeql resolve build-environment'
+   */
+  resolveBuildEnvironment(
+    workingDir: string | undefined,
+    language: Language,
+  ): Promise<ResolveBuildEnvironmentOutput>;
 
   /**
    * Run 'codeql pack download'.
    */
   packDownload(
     packs: string[],
-    qlconfigFile: string | undefined
+    qlconfigFile: string | undefined,
   ): Promise<PackDownloadOutput>;
 
   /**
@@ -150,17 +148,24 @@ export interface CodeQL {
   databaseBundle(
     databasePath: string,
     outputFilePath: string,
-    dbName: string
+    dbName: string,
   ): Promise<void>;
   /**
    * Run 'codeql database run-queries'.
+   *
+   * @param optimizeForLastQueryRun Whether to apply additional optimization for
+   *                                the last database query run in the action.
+   *                                It is always safe to set it to false.
+   *                                It should be set to true only for the very
+   *                                last databaseRunQueries() call.
    */
   databaseRunQueries(
     databasePath: string,
     extraSearchPath: string | undefined,
     querySuitePath: string | undefined,
-    memoryFlag: string,
-    threadsFlag: string
+    flags: string[],
+    optimizeForLastQueryRun: boolean,
+    features: FeatureEnablement,
   ): Promise<void>;
   /**
    * Run 'codeql database interpret-results'.
@@ -173,12 +178,37 @@ export interface CodeQL {
     threadsFlag: string,
     verbosityFlag: string | undefined,
     automationDetailsId: string | undefined,
-    featureEnablement: FeatureEnablement
+    config: Config,
+    features: FeatureEnablement,
+    logger: Logger,
   ): Promise<string>;
   /**
    * Run 'codeql database print-baseline'.
    */
   databasePrintBaseline(databasePath: string): Promise<string>;
+  /**
+   * Run 'codeql database export-diagnostics'
+   *
+   * Note that the "--sarif-include-diagnostics" option is always used, as the command should
+   * only be run if the ExportDiagnosticsEnabled feature flag is on.
+   */
+  databaseExportDiagnostics(
+    databasePath: string,
+    sarifFile: string,
+    automationDetailsId: string | undefined,
+    tempDir: string,
+    logger: Logger,
+  ): Promise<void>;
+  /**
+   * Run 'codeql diagnostics export'.
+   */
+  diagnosticsExport(
+    sarifFile: string,
+    automationDetailsId: string | undefined,
+    config: Config,
+  ): Promise<void>;
+  /** Get the location of an extractor for the specified language. */
+  resolveExtractor(language: Language): Promise<string>;
 }
 
 export interface ResolveLanguagesOutput {
@@ -186,12 +216,15 @@ export interface ResolveLanguagesOutput {
 }
 
 export interface BetterResolveLanguagesOutput {
+  aliases?: {
+    [alias: string]: string;
+  };
   extractors: {
     [language: string]: [
       {
         extractor_root: string;
         extractor_options?: any;
-      }
+      },
     ];
   };
 }
@@ -207,6 +240,14 @@ export interface ResolveQueriesOutput {
   };
   multipleDeclaredLanguages: {
     [queryPath: string]: {};
+  };
+}
+
+export interface ResolveBuildEnvironmentOutput {
+  configuration?: {
+    [language: string]: {
+      [key: string]: unknown;
+    };
   };
 }
 
@@ -227,9 +268,6 @@ interface PackDownloadItem {
  */
 let cachedCodeQL: CodeQL | undefined = undefined;
 
-const CODEQL_BUNDLE_VERSION = defaults.bundleVersion;
-export const CODEQL_DEFAULT_ACTION_REPOSITORY = "github/codeql-action";
-
 /**
  * The oldest version of CodeQL that the Action will run with. This should be
  * at least three minor versions behind the current version and must include the
@@ -238,42 +276,32 @@ export const CODEQL_DEFAULT_ACTION_REPOSITORY = "github/codeql-action";
  * The version flags below can be used to conditionally enable certain features
  * on versions newer than this.
  */
-const CODEQL_MINIMUM_VERSION = "2.6.3";
+const CODEQL_MINIMUM_VERSION = "2.9.4";
+
+/**
+ * This version will shortly become the oldest version of CodeQL that the Action will run with.
+ */
+const CODEQL_NEXT_MINIMUM_VERSION = "2.10.5";
+
+/**
+ * This is the version of GHES that was most recently deprecated.
+ */
+const GHES_VERSION_MOST_RECENTLY_DEPRECATED = "3.6";
+
+/**
+ * This is the deprecation date for the version of GHES that was most recently deprecated.
+ */
+const GHES_MOST_RECENT_DEPRECATION_DATE = "2023-09-12";
 
 /**
  * Versions of CodeQL that version-flag certain functionality in the Action.
  * For convenience, please keep these in descending order. Once a version
  * flag is older than the oldest supported version above, it may be removed.
  */
-const CODEQL_VERSION_CUSTOM_QUERY_HELP = "2.7.1";
 const CODEQL_VERSION_LUA_TRACER_CONFIG = "2.10.0";
-export const CODEQL_VERSION_CONFIG_FILES = "2.10.1";
 const CODEQL_VERSION_LUA_TRACING_GO_WINDOWS_FIXED = "2.10.4";
 export const CODEQL_VERSION_GHES_PACK_DOWNLOAD = "2.10.4";
-
-/**
- * This variable controls using the new style of tracing from the CodeQL
- * CLI. In particular, with versions above this we will use both indirect
- * tracing, and multi-language tracing together with database clusters.
- *
- * Note that there were bugs in both of these features that were fixed in
- * release 2.7.0 of the CodeQL CLI, therefore this flag is only enabled for
- * versions above that.
- */
-export const CODEQL_VERSION_NEW_TRACING = "2.7.0";
-
-/**
- * Versions 2.7.3+ of the CodeQL CLI support build tracing with glibc 2.34 on Linux. Versions before
- * this cannot perform build tracing when running on the Actions `ubuntu-22.04` runner image.
- */
-export const CODEQL_VERSION_TRACING_GLIBC_2_34 = "2.7.3";
-
-/**
- * Versions 2.9.0+ of the CodeQL CLI run machine learning models from a temporary directory, which
- * resolves an issue on Windows where TensorFlow models are not correctly loaded due to the path of
- * some of their files being greater than MAX_PATH (260 characters).
- */
-export const CODEQL_VERSION_ML_POWERED_QUERIES_WINDOWS = "2.9.0";
+const CODEQL_VERSION_FILE_BASELINE_INFORMATION = "2.11.3";
 
 /**
  * Previous versions had the option already, but were missing the
@@ -281,249 +309,86 @@ export const CODEQL_VERSION_ML_POWERED_QUERIES_WINDOWS = "2.9.0";
  */
 export const CODEQL_VERSION_BETTER_RESOLVE_LANGUAGES = "2.10.3";
 
-function getCodeQLBundleName(): string {
-  let platform: string;
-  if (process.platform === "win32") {
-    platform = "win64";
-  } else if (process.platform === "linux") {
-    platform = "linux64";
-  } else if (process.platform === "darwin") {
-    platform = "osx64";
-  } else {
-    return "codeql-bundle.tar.gz";
-  }
-  return `codeql-bundle-${platform}.tar.gz`;
-}
+/**
+ * Versions 2.11.1+ of the CodeQL Bundle include a `security-experimental` built-in query suite for
+ * each language.
+ */
+export const CODEQL_VERSION_SECURITY_EXPERIMENTAL_SUITE = "2.12.1";
 
-export function getCodeQLActionRepository(logger: Logger): string {
-  if (isRunningLocalAction()) {
-    // This handles the case where the Action does not come from an Action repository,
-    // e.g. our integration tests which use the Action code from the current checkout.
-    // In these cases, the GITHUB_ACTION_REPOSITORY environment variable is not set.
-    logger.info(
-      "The CodeQL Action is checked out locally. Using the default CodeQL Action repository."
-    );
-    return CODEQL_DEFAULT_ACTION_REPOSITORY;
-  }
+/**
+ * Versions 2.12.3+ of the CodeQL CLI support exporting configuration information from a code
+ * scanning config file to SARIF.
+ */
+export const CODEQL_VERSION_EXPORT_CODE_SCANNING_CONFIG = "2.12.3";
 
-  return util.getRequiredEnvParam("GITHUB_ACTION_REPOSITORY");
-}
+/**
+ * Versions 2.12.4+ of the CodeQL CLI support the `--qlconfig-file` flag in calls to `database init`.
+ */
+export const CODEQL_VERSION_INIT_WITH_QLCONFIG = "2.12.4";
 
-async function getCodeQLBundleDownloadURL(
-  apiDetails: api.GitHubApiDetails,
-  variant: util.GitHubVariant,
-  logger: Logger
-): Promise<string> {
-  const codeQLActionRepository = getCodeQLActionRepository(logger);
-  const potentialDownloadSources = [
-    // This GitHub instance, and this Action.
-    [apiDetails.url, codeQLActionRepository],
-    // This GitHub instance, and the canonical Action.
-    [apiDetails.url, CODEQL_DEFAULT_ACTION_REPOSITORY],
-    // GitHub.com, and the canonical Action.
-    [util.GITHUB_DOTCOM_URL, CODEQL_DEFAULT_ACTION_REPOSITORY],
-  ];
-  // We now filter out any duplicates.
-  // Duplicates will happen either because the GitHub instance is GitHub.com, or because the Action is not a fork.
-  const uniqueDownloadSources = potentialDownloadSources.filter(
-    (source, index, self) => {
-      return !self.slice(0, index).some((other) => deepEqual(source, other));
-    }
-  );
-  const codeQLBundleName = getCodeQLBundleName();
-  if (variant === util.GitHubVariant.GHAE) {
-    try {
-      const release = await api
-        .getApiClient()
-        .request("GET /enterprise/code-scanning/codeql-bundle/find/{tag}", {
-          tag: CODEQL_BUNDLE_VERSION,
-        });
-      const assetID = release.data.assets[codeQLBundleName];
-      if (assetID !== undefined) {
-        const download = await api
-          .getApiClient()
-          .request(
-            "GET /enterprise/code-scanning/codeql-bundle/download/{asset_id}",
-            { asset_id: assetID }
-          );
-        const downloadURL = download.data.url;
-        logger.info(
-          `Found CodeQL bundle at GitHub AE endpoint with URL ${downloadURL}.`
-        );
-        return downloadURL;
-      } else {
-        logger.info(
-          `Attempted to fetch bundle from GitHub AE endpoint but the bundle ${codeQLBundleName} was not found in the assets ${JSON.stringify(
-            release.data.assets
-          )}.`
-        );
-      }
-    } catch (e) {
-      logger.info(
-        `Attempted to fetch bundle from GitHub AE endpoint but got error ${e}.`
-      );
-    }
-  }
-  for (const downloadSource of uniqueDownloadSources) {
-    const [apiURL, repository] = downloadSource;
-    // If we've reached the final case, short-circuit the API check since we know the bundle exists and is public.
-    if (
-      apiURL === util.GITHUB_DOTCOM_URL &&
-      repository === CODEQL_DEFAULT_ACTION_REPOSITORY
-    ) {
-      break;
-    }
-    const [repositoryOwner, repositoryName] = repository.split("/");
-    try {
-      const release = await api.getApiClient().repos.getReleaseByTag({
-        owner: repositoryOwner,
-        repo: repositoryName,
-        tag: CODEQL_BUNDLE_VERSION,
-      });
-      for (const asset of release.data.assets) {
-        if (asset.name === codeQLBundleName) {
-          logger.info(
-            `Found CodeQL bundle in ${downloadSource[1]} on ${downloadSource[0]} with URL ${asset.url}.`
-          );
-          return asset.url;
-        }
-      }
-    } catch (e) {
-      logger.info(
-        `Looked for CodeQL bundle in ${downloadSource[1]} on ${downloadSource[0]} but got error ${e}.`
-      );
-    }
-  }
-  return `https://github.com/${CODEQL_DEFAULT_ACTION_REPOSITORY}/releases/download/${CODEQL_BUNDLE_VERSION}/${codeQLBundleName}`;
-}
+/**
+ * Versions 2.12.4+ of the CodeQL CLI provide a better error message when `database finalize`
+ * determines that no code has been found.
+ */
+export const CODEQL_VERSION_BETTER_NO_CODE_ERROR_MESSAGE = "2.12.4";
+
+/**
+ * Versions 2.13.1+ of the CodeQL CLI fix a bug where diagnostics export could produce invalid SARIF.
+ */
+export const CODEQL_VERSION_DIAGNOSTICS_EXPORT_FIXED = "2.13.1";
+
+/**
+ * Versions 2.13.4+ of the CodeQL CLI support the `resolve build-environment` command.
+ */
+export const CODEQL_VERSION_RESOLVE_ENVIRONMENT = "2.13.4";
+
+/**
+ * Versions 2.14.2+ of the CodeQL CLI support language-specific baseline configuration.
+ */
+export const CODEQL_VERSION_LANGUAGE_BASELINE_CONFIG = "2.14.2";
+
+/**
+ * Versions 2.14.4+ of the CodeQL CLI support language aliasing.
+ */
+export const CODEQL_VERSION_LANGUAGE_ALIASING = "2.14.4";
 
 /**
  * Set up CodeQL CLI access.
  *
- * @param codeqlURL
+ * @param toolsInput
  * @param apiDetails
  * @param tempDir
  * @param variant
- * @param features
+ * @param defaultCliVersion
  * @param logger
  * @param checkVersion Whether to check that CodeQL CLI meets the minimum
  *        version requirement. Must be set to true outside tests.
  * @returns a { CodeQL, toolsVersion } object.
  */
 export async function setupCodeQL(
-  codeqlURL: string | undefined,
+  toolsInput: string | undefined,
   apiDetails: api.GitHubApiDetails,
   tempDir: string,
   variant: util.GitHubVariant,
-  bypassToolcache: boolean,
+  defaultCliVersion: CodeQLDefaultVersionInfo,
   logger: Logger,
-  checkVersion: boolean
-): Promise<{ codeql: CodeQL; toolsVersion: string }> {
+  checkVersion: boolean,
+): Promise<{
+  codeql: CodeQL;
+  toolsDownloadDurationMs?: number;
+  toolsSource: setupCodeql.ToolsSource;
+  toolsVersion: string;
+}> {
   try {
-    const forceLatestReason =
-      // We use the special value of 'latest' to prioritize the version in the
-      // defaults over any pinned cached version.
-      codeqlURL === "latest"
-        ? '"tools: latest" was requested'
-        : // If the user hasn't requested a particular CodeQL version, then bypass
-        // the toolcache when the appropriate feature is enabled. This
-        // allows us to quickly rollback a broken bundle that has made its way
-        // into the toolcache.
-        codeqlURL === undefined && bypassToolcache
-        ? "a specific version of CodeQL was not requested and the bypass toolcache feature is enabled"
-        : undefined;
-    const forceLatest = forceLatestReason !== undefined;
-    if (forceLatest) {
-      logger.debug(
-        `Forcing the latest version of the CodeQL tools since ${forceLatestReason}.`
+    const { codeqlFolder, toolsDownloadDurationMs, toolsSource, toolsVersion } =
+      await setupCodeql.setupCodeQLBundle(
+        toolsInput,
+        apiDetails,
+        tempDir,
+        variant,
+        defaultCliVersion,
+        logger,
       );
-      codeqlURL = undefined;
-    }
-    let codeqlFolder: string;
-    let codeqlURLVersion: string;
-    if (codeqlURL && !codeqlURL.startsWith("http")) {
-      codeqlFolder = await toolcache.extractTar(codeqlURL);
-      codeqlURLVersion = "local";
-    } else {
-      codeqlURLVersion = getCodeQLURLVersion(
-        codeqlURL || `/${CODEQL_BUNDLE_VERSION}/`
-      );
-      const codeqlURLSemVer = convertToSemVer(codeqlURLVersion, logger);
-
-      // If we find the specified version, we always use that.
-      codeqlFolder = toolcache.find("CodeQL", codeqlURLSemVer);
-
-      // If we don't find the requested version, in some cases we may allow a
-      // different version to save download time if the version hasn't been
-      // specified explicitly (in which case we always honor it).
-      if (!codeqlFolder && !codeqlURL && !forceLatest) {
-        const codeqlVersions = toolcache.findAllVersions("CodeQL");
-        if (codeqlVersions.length === 1 && isGoodVersion(codeqlVersions[0])) {
-          const tmpCodeqlFolder = toolcache.find("CodeQL", codeqlVersions[0]);
-          if (fs.existsSync(path.join(tmpCodeqlFolder, "pinned-version"))) {
-            logger.debug(
-              `CodeQL in cache overriding the default ${CODEQL_BUNDLE_VERSION}`
-            );
-            codeqlFolder = tmpCodeqlFolder;
-            codeqlURLVersion = codeqlVersions[0];
-          }
-        }
-      }
-
-      if (codeqlFolder) {
-        logger.debug(`CodeQL found in cache ${codeqlFolder}`);
-      } else {
-        if (!codeqlURL) {
-          codeqlURL = await getCodeQLBundleDownloadURL(
-            apiDetails,
-            variant,
-            logger
-          );
-        }
-
-        const parsedCodeQLURL = new URL(codeqlURL);
-        const parsedQueryString = queryString.parse(parsedCodeQLURL.search);
-        const headers: OutgoingHttpHeaders = {
-          accept: "application/octet-stream",
-        };
-        // We only want to provide an authorization header if we are downloading
-        // from the same GitHub instance the Action is running on.
-        // This avoids leaking Enterprise tokens to dotcom.
-        // We also don't want to send an authorization header if there's already a token provided in the URL.
-        if (
-          codeqlURL.startsWith(`${apiDetails.url}/`) &&
-          parsedQueryString["token"] === undefined
-        ) {
-          logger.debug("Downloading CodeQL bundle with token.");
-          headers.authorization = `token ${apiDetails.auth}`;
-        } else {
-          logger.debug("Downloading CodeQL bundle without token.");
-        }
-        logger.info(
-          `Downloading CodeQL tools from ${codeqlURL}. This may take a while.`
-        );
-
-        const dest = path.join(tempDir, uuidV4());
-        const finalHeaders = Object.assign(
-          { "User-Agent": "CodeQL Action" },
-          headers
-        );
-        const codeqlPath = await toolcache.downloadTool(
-          codeqlURL,
-          dest,
-          undefined,
-          finalHeaders
-        );
-        logger.debug(`CodeQL bundle download to ${codeqlPath} complete.`);
-
-        const codeqlExtracted = await toolcache.extractTar(codeqlPath);
-        codeqlFolder = await toolcache.cacheDir(
-          codeqlExtracted,
-          "CodeQL",
-          codeqlURLSemVer
-        );
-      }
-    }
     let codeqlCmd = path.join(codeqlFolder, "codeql", "codeql");
     if (process.platform === "win32") {
       codeqlCmd += ".exe";
@@ -532,37 +397,17 @@ export async function setupCodeQL(
     }
 
     cachedCodeQL = await getCodeQLForCmd(codeqlCmd, checkVersion);
-    return { codeql: cachedCodeQL, toolsVersion: codeqlURLVersion };
+    return {
+      codeql: cachedCodeQL,
+      toolsDownloadDurationMs,
+      toolsSource,
+      toolsVersion,
+    };
   } catch (e) {
-    logger.error(e instanceof Error ? e : new Error(String(e)));
-    throw new Error("Unable to download and extract CodeQL CLI");
-  }
-}
-
-export function getCodeQLURLVersion(url: string): string {
-  const match = url.match(/\/codeql-bundle-(.*)\//);
-  if (match === null || match.length < 2) {
     throw new Error(
-      `Malformed tools url: ${url}. Version could not be inferred`
+      `Unable to download and extract CodeQL CLI: ${wrapError(e).message}`,
     );
   }
-  return match[1];
-}
-
-export function convertToSemVer(version: string, logger: Logger): string {
-  if (!semver.valid(version)) {
-    logger.debug(
-      `Bundle version ${version} is not in SemVer format. Will treat it as pre-release 0.0.0-${version}.`
-    );
-    version = `0.0.0-${version}`;
-  }
-
-  const s = semver.clean(version);
-  if (!s) {
-    throw new Error(`Bundle version ${version} is not in SemVer format.`);
-  }
-
-  return s;
 }
 
 /**
@@ -578,7 +423,7 @@ export async function getCodeQL(cmd: string): Promise<CodeQL> {
 function resolveFunction<T>(
   partialCodeql: Partial<CodeQL>,
   methodName: string,
-  defaultImplementation?: T
+  defaultImplementation?: T,
 ): T {
   if (typeof partialCodeql[methodName] !== "function") {
     if (defaultImplementation !== undefined) {
@@ -604,36 +449,44 @@ export function setCodeQL(partialCodeql: Partial<CodeQL>): CodeQL {
     getVersion: resolveFunction(
       partialCodeql,
       "getVersion",
-      () => new Promise((resolve) => resolve("1.0.0"))
+      () => new Promise((resolve) => resolve("1.0.0")),
     ),
     printVersion: resolveFunction(partialCodeql, "printVersion"),
-    getTracerEnv: resolveFunction(partialCodeql, "getTracerEnv"),
-    databaseInit: resolveFunction(partialCodeql, "databaseInit"),
     databaseInitCluster: resolveFunction(partialCodeql, "databaseInitCluster"),
     runAutobuild: resolveFunction(partialCodeql, "runAutobuild"),
     extractScannedLanguage: resolveFunction(
       partialCodeql,
-      "extractScannedLanguage"
+      "extractScannedLanguage",
     ),
     finalizeDatabase: resolveFunction(partialCodeql, "finalizeDatabase"),
     resolveLanguages: resolveFunction(partialCodeql, "resolveLanguages"),
     betterResolveLanguages: resolveFunction(
       partialCodeql,
-      "betterResolveLanguages"
+      "betterResolveLanguages",
     ),
     resolveQueries: resolveFunction(partialCodeql, "resolveQueries"),
+    resolveBuildEnvironment: resolveFunction(
+      partialCodeql,
+      "resolveBuildEnvironment",
+    ),
     packDownload: resolveFunction(partialCodeql, "packDownload"),
     databaseCleanup: resolveFunction(partialCodeql, "databaseCleanup"),
     databaseBundle: resolveFunction(partialCodeql, "databaseBundle"),
     databaseRunQueries: resolveFunction(partialCodeql, "databaseRunQueries"),
     databaseInterpretResults: resolveFunction(
       partialCodeql,
-      "databaseInterpretResults"
+      "databaseInterpretResults",
     ),
     databasePrintBaseline: resolveFunction(
       partialCodeql,
-      "databasePrintBaseline"
+      "databasePrintBaseline",
     ),
+    databaseExportDiagnostics: resolveFunction(
+      partialCodeql,
+      "databaseExportDiagnostics",
+    ),
+    diagnosticsExport: resolveFunction(partialCodeql, "diagnosticsExport"),
+    resolveExtractor: resolveFunction(partialCodeql, "resolveExtractor"),
   };
   return cachedCodeQL;
 }
@@ -658,7 +511,7 @@ export function getCachedCodeQL(): CodeQL {
  * should also stub the toolrunner.ToolRunner constructor.
  */
 export async function getCodeQLForTesting(
-  cmd = "codeql-for-testing"
+  cmd = "codeql-for-testing",
 ): Promise<CodeQL> {
   return getCodeQLForCmd(cmd, false);
 }
@@ -671,11 +524,11 @@ export async function getCodeQLForTesting(
  *        version requirement. Must be set to true outside tests.
  * @returns A new CodeQL object
  */
-async function getCodeQLForCmd(
+export async function getCodeQLForCmd(
   cmd: string,
-  checkVersion: boolean
+  checkVersion: boolean,
 ): Promise<CodeQL> {
-  const codeql = {
+  const codeql: CodeQL = {
     getPath() {
       return cmd;
     },
@@ -690,102 +543,16 @@ async function getCodeQLForCmd(
     async printVersion() {
       await runTool(cmd, ["version", "--format=json"]);
     },
-    async getTracerEnv(databasePath: string) {
-      // Write tracer-env.js to a temp location.
-      // BEWARE: The name and location of this file is recognized by `codeql database
-      // trace-command` in order to enable special support for concatenable tracer
-      // configurations. Consequently the name must not be changed.
-      // (This warning can be removed once a different way to recognize the
-      // action/runner has been implemented in `codeql database trace-command`
-      // _and_ is present in the latest supported CLI release.)
-      const tracerEnvJs = path.resolve(
-        databasePath,
-        "working",
-        "tracer-env.js"
-      );
-
-      fs.mkdirSync(path.dirname(tracerEnvJs), { recursive: true });
-      fs.writeFileSync(
-        tracerEnvJs,
-        `
-        const fs = require('fs');
-        const env = {};
-        for (let entry of Object.entries(process.env)) {
-          const key = entry[0];
-          const value = entry[1];
-          if (typeof value !== 'undefined' && key !== '_' && !key.startsWith('JAVA_MAIN_CLASS_')) {
-            env[key] = value;
-          }
-        }
-        process.stdout.write(process.argv[2]);
-        fs.writeFileSync(process.argv[2], JSON.stringify(env), 'utf-8');`
-      );
-
-      // BEWARE: The name and location of this file is recognized by `codeql database
-      // trace-command` in order to enable special support for concatenable tracer
-      // configurations. Consequently the name must not be changed.
-      // (This warning can be removed once a different way to recognize the
-      // action/runner has been implemented in `codeql database trace-command`
-      // _and_ is present in the latest supported CLI release.)
-      const envFile = path.resolve(databasePath, "working", "env.tmp");
-
-      try {
-        await runTool(cmd, [
-          "database",
-          "trace-command",
-          databasePath,
-          ...getExtraOptionsFromEnv(["database", "trace-command"]),
-          process.execPath,
-          tracerEnvJs,
-          envFile,
-        ]);
-      } catch (e) {
-        if (
-          e instanceof CommandInvocationError &&
-          e.output.includes(
-            "undefined symbol: __libc_dlopen_mode, version GLIBC_PRIVATE"
-          ) &&
-          process.platform === "linux" &&
-          !(await util.codeQlVersionAbove(
-            this,
-            CODEQL_VERSION_TRACING_GLIBC_2_34
-          ))
-        ) {
-          throw new util.UserError(
-            "The CodeQL CLI is incompatible with the version of glibc on your system. " +
-              `Please upgrade to CodeQL CLI version ${CODEQL_VERSION_TRACING_GLIBC_2_34} or ` +
-              "later. If you cannot upgrade to a newer version of the CodeQL CLI, you can " +
-              `alternatively run your workflow on another runner image such as "ubuntu-20.04" ` +
-              "that has glibc 2.33 or earlier installed."
-          );
-        } else {
-          throw e;
-        }
-      }
-      return JSON.parse(fs.readFileSync(envFile, "utf-8"));
-    },
-    async databaseInit(
-      databasePath: string,
-      language: Language,
-      sourceRoot: string
-    ) {
-      await runTool(cmd, [
-        "database",
-        "init",
-        databasePath,
-        `--language=${language}`,
-        `--source-root=${sourceRoot}`,
-        ...getExtraOptionsFromEnv(["database", "init"]),
-      ]);
-    },
     async databaseInitCluster(
       config: Config,
       sourceRoot: string,
       processName: string | undefined,
-      featureEnablement: FeatureEnablement
+      features: FeatureEnablement,
+      qlconfigFile: string | undefined,
+      logger: Logger,
     ) {
       const extraArgs = config.languages.map(
-        (language) => `--language=${language}`
+        (language) => `--language=${language}`,
       );
       if (config.languages.filter((l) => isTracedLanguage(l)).length > 0) {
         extraArgs.push("--begin-tracing");
@@ -797,51 +564,72 @@ async function getCodeQLForCmd(
           // when tracing Go on Windows on these CodeQL versions.
           (await util.codeQlVersionAbove(
             this,
-            CODEQL_VERSION_LUA_TRACER_CONFIG
+            CODEQL_VERSION_LUA_TRACER_CONFIG,
           )) &&
           config.languages.includes(Language.go) &&
           isTracedLanguage(Language.go) &&
           process.platform === "win32" &&
           !(await util.codeQlVersionAbove(
             this,
-            CODEQL_VERSION_LUA_TRACING_GO_WINDOWS_FIXED
+            CODEQL_VERSION_LUA_TRACING_GO_WINDOWS_FIXED,
           ))
         ) {
           extraArgs.push("--no-internal-use-lua-tracing");
         }
       }
 
-      const configLocation = await generateCodeScanningConfig(
+      // A code scanning config file is only generated if the CliConfigFileEnabled feature flag is enabled.
+      const codeScanningConfigFile = await generateCodeScanningConfig(
         codeql,
         config,
-        featureEnablement
+        features,
+        logger,
       );
-      if (configLocation) {
-        extraArgs.push(`--codescanning-config=${configLocation}`);
+      // Only pass external repository token if a config file is going to be parsed by the CLI.
+      let externalRepositoryToken: string | undefined;
+      if (codeScanningConfigFile) {
+        externalRepositoryToken = getOptionalInput("external-repository-token");
+        extraArgs.push(`--codescanning-config=${codeScanningConfigFile}`);
+        if (externalRepositoryToken) {
+          extraArgs.push("--external-repository-token-stdin");
+        }
       }
 
-      await runTool(cmd, [
-        "database",
-        "init",
-        "--db-cluster",
-        config.dbLocation,
-        `--source-root=${sourceRoot}`,
-        ...extraArgs,
-        ...getExtraOptionsFromEnv(["database", "init"]),
-      ]);
+      if (
+        qlconfigFile !== undefined &&
+        (await util.codeQlVersionAbove(this, CODEQL_VERSION_INIT_WITH_QLCONFIG))
+      ) {
+        extraArgs.push(`--qlconfig-file=${qlconfigFile}`);
+      }
+
+      if (
+        await util.codeQlVersionAbove(
+          this,
+          CODEQL_VERSION_LANGUAGE_BASELINE_CONFIG,
+        )
+      ) {
+        extraArgs.push("--calculate-language-specific-baseline");
+      }
+
+      await runTool(
+        cmd,
+        [
+          "database",
+          "init",
+          "--db-cluster",
+          config.dbLocation,
+          `--source-root=${sourceRoot}`,
+          ...extraArgs,
+          ...getExtraOptionsFromEnv(["database", "init"]),
+        ],
+        { stdin: externalRepositoryToken },
+      );
     },
     async runAutobuild(language: Language) {
-      const cmdName =
-        process.platform === "win32" ? "autobuild.cmd" : "autobuild.sh";
-      // The autobuilder for Swift is located in the experimental/ directory.
-      const possibleExperimentalDir =
-        language === Language.swift ? "experimental" : "";
       const autobuildCmd = path.join(
-        path.dirname(cmd),
-        possibleExperimentalDir,
-        language,
+        await this.resolveExtractor(language),
         "tools",
-        cmdName
+        process.platform === "win32" ? "autobuild.cmd" : "autobuild.sh",
       );
 
       // Update JAVA_TOOL_OPTIONS to contain '-Dhttp.keepAlive=false'
@@ -874,56 +662,29 @@ async function getCodeQLForCmd(
     },
     async extractScannedLanguage(config: Config, language: Language) {
       const databasePath = util.getCodeQLDatabasePath(config, language);
-      // Get extractor location
-      let extractorPath = "";
-      await new toolrunner.ToolRunner(
-        cmd,
-        [
-          "resolve",
-          "extractor",
-          "--format=json",
-          `--language=${language}`,
-          ...getExtraOptionsFromEnv(["resolve", "extractor"]),
-        ],
-        {
-          silent: true,
-          listeners: {
-            stdout: (data) => {
-              extractorPath += data.toString();
-            },
-            stderr: (data) => {
-              process.stderr.write(data);
-            },
-          },
-        }
-      ).exec();
 
       // Set trace command
       const ext = process.platform === "win32" ? ".cmd" : ".sh";
       const traceCommand = path.resolve(
-        JSON.parse(extractorPath),
+        await this.resolveExtractor(language),
         "tools",
-        `autobuild${ext}`
+        `autobuild${ext}`,
       );
       // Run trace command
-      await toolrunnerErrorCatcher(
-        cmd,
-        [
-          "database",
-          "trace-command",
-          ...(await getTrapCachingExtractorConfigArgsForLang(config, language)),
-          ...getExtraOptionsFromEnv(["database", "trace-command"]),
-          databasePath,
-          "--",
-          traceCommand,
-        ],
-        errorMatchers
-      );
+      await runTool(cmd, [
+        "database",
+        "trace-command",
+        ...(await getTrapCachingExtractorConfigArgsForLang(config, language)),
+        ...getExtraOptionsFromEnv(["database", "trace-command"]),
+        databasePath,
+        "--",
+        traceCommand,
+      ]);
     },
     async finalizeDatabase(
       databasePath: string,
       threadsFlag: string,
-      memoryFlag: string
+      memoryFlag: string,
     ) {
       const args = [
         "database",
@@ -934,7 +695,24 @@ async function getCodeQLForCmd(
         ...getExtraOptionsFromEnv(["database", "finalize"]),
         databasePath,
       ];
-      await toolrunnerErrorCatcher(cmd, args, errorMatchers);
+      try {
+        await runTool(cmd, args);
+      } catch (e) {
+        if (
+          e instanceof CommandInvocationError &&
+          !(await util.codeQlVersionAbove(
+            this,
+            CODEQL_VERSION_BETTER_NO_CODE_ERROR_MESSAGE,
+          )) &&
+          isNoCodeFoundError(e)
+        ) {
+          throw new util.UserError(
+            "No code found during the build. Please see: " +
+              "https://gh.io/troubleshooting-code-scanning/no-source-code-seen-during-build",
+          );
+        }
+        throw e;
+      }
     },
     async resolveLanguages() {
       const codeqlArgs = [
@@ -949,16 +727,25 @@ async function getCodeQLForCmd(
         return JSON.parse(output);
       } catch (e) {
         throw new Error(
-          `Unexpected output from codeql resolve languages: ${e}`
+          `Unexpected output from codeql resolve languages: ${e}`,
         );
       }
     },
     async betterResolveLanguages() {
+      const extraArgs: string[] = [];
+
+      if (
+        await util.codeQlVersionAbove(this, CODEQL_VERSION_LANGUAGE_ALIASING)
+      ) {
+        extraArgs.push("--extractor-include-aliases");
+      }
+
       const codeqlArgs = [
         "resolve",
         "languages",
         "--format=betterjson",
         "--extractor-options-verbosity=4",
+        ...extraArgs,
         ...getExtraOptionsFromEnv(["resolve", "languages"]),
       ];
       const output = await runTool(cmd, codeqlArgs);
@@ -967,13 +754,13 @@ async function getCodeQLForCmd(
         return JSON.parse(output);
       } catch (e) {
         throw new Error(
-          `Unexpected output from codeql resolve languages with --format=betterjson: ${e}`
+          `Unexpected output from codeql resolve languages with --format=betterjson: ${e}`,
         );
       }
     },
     async resolveQueries(
       queries: string[],
-      extraSearchPath: string | undefined
+      extraSearchPath: string | undefined,
     ) {
       const codeqlArgs = [
         "resolve",
@@ -993,28 +780,72 @@ async function getCodeQLForCmd(
         throw new Error(`Unexpected output from codeql resolve queries: ${e}`);
       }
     },
+    async resolveBuildEnvironment(
+      workingDir: string | undefined,
+      language: Language,
+    ) {
+      const codeqlArgs = [
+        "resolve",
+        "build-environment",
+        `--language=${language}`,
+        ...getExtraOptionsFromEnv(["resolve", "build-environment"]),
+      ];
+      if (workingDir !== undefined) {
+        codeqlArgs.push("--working-dir", workingDir);
+      }
+      const output = await runTool(cmd, codeqlArgs);
+
+      try {
+        return JSON.parse(output);
+      } catch (e) {
+        throw new Error(
+          `Unexpected output from codeql resolve build-environment: ${e} in\n${output}`,
+        );
+      }
+    },
     async databaseRunQueries(
       databasePath: string,
       extraSearchPath: string | undefined,
       querySuitePath: string | undefined,
-      memoryFlag: string,
-      threadsFlag: string
+      flags: string[],
+      optimizeForLastQueryRun: boolean,
+      features: FeatureEnablement,
     ): Promise<void> {
       const codeqlArgs = [
         "database",
         "run-queries",
-        memoryFlag,
-        threadsFlag,
+        ...flags,
         databasePath,
         "--min-disk-free=1024", // Try to leave at least 1GB free
         "-v",
         ...getExtraOptionsFromEnv(["database", "run-queries"]),
       ];
+      if (
+        optimizeForLastQueryRun &&
+        (await util.supportExpectDiscardedCache(this))
+      ) {
+        codeqlArgs.push("--expect-discarded-cache");
+      }
       if (extraSearchPath !== undefined) {
         codeqlArgs.push("--additional-packs", extraSearchPath);
       }
       if (querySuitePath) {
         codeqlArgs.push(querySuitePath);
+      }
+      if (
+        await features.getValue(
+          Feature.EvaluatorIntraLayerParallelismEnabled,
+          this,
+        )
+      ) {
+        codeqlArgs.push("--intra-layer-parallelism");
+      } else if (
+        await util.codeQlVersionAbove(
+          this,
+          CODEQL_VERSION_INTRA_LAYER_PARALLELISM,
+        )
+      ) {
+        codeqlArgs.push("--no-intra-layer-parallelism");
       }
       await runTool(cmd, codeqlArgs);
     },
@@ -1026,40 +857,73 @@ async function getCodeQLForCmd(
       threadsFlag: string,
       verbosityFlag: string,
       automationDetailsId: string | undefined,
-      featureEnablement: FeatureEnablement
+      config: Config,
+      features: FeatureEnablement,
+      logger: Logger,
     ): Promise<string> {
+      const shouldExportDiagnostics = await features.getValue(
+        Feature.ExportDiagnosticsEnabled,
+        this,
+      );
+      const shouldWorkaroundInvalidNotifications =
+        shouldExportDiagnostics &&
+        !(await isDiagnosticsExportInvalidSarifFixed(this));
+      const codeqlOutputFile = shouldWorkaroundInvalidNotifications
+        ? path.join(config.tempDir, "codeql-intermediate-results.sarif")
+        : sarifFile;
       const codeqlArgs = [
         "database",
         "interpret-results",
         threadsFlag,
         "--format=sarif-latest",
         verbosityFlag,
-        `--output=${sarifFile}`,
+        `--output=${codeqlOutputFile}`,
         addSnippetsFlag,
         "--print-diagnostics-summary",
         "--print-metrics-summary",
+        "--sarif-add-query-help",
         "--sarif-group-rules-by-pack",
+        ...(await getCodeScanningConfigExportArguments(config, this)),
         ...getExtraOptionsFromEnv(["database", "interpret-results"]),
       ];
-      if (await util.codeQlVersionAbove(this, CODEQL_VERSION_CUSTOM_QUERY_HELP))
-        codeqlArgs.push("--sarif-add-query-help");
       if (automationDetailsId !== undefined) {
         codeqlArgs.push("--sarif-category", automationDetailsId);
       }
       if (
-        await featureEnablement.getValue(
-          Feature.FileBaselineInformationEnabled,
-          this
+        await util.codeQlVersionAbove(
+          this,
+          CODEQL_VERSION_FILE_BASELINE_INFORMATION,
         )
       ) {
         codeqlArgs.push("--sarif-add-baseline-file-info");
+      }
+      if (shouldExportDiagnostics) {
+        codeqlArgs.push("--sarif-include-diagnostics");
+      } else if (await util.codeQlVersionAbove(this, "2.12.4")) {
+        codeqlArgs.push("--no-sarif-include-diagnostics");
+      }
+      if (await features.getValue(Feature.AnalysisSummaryV2Enabled, this)) {
+        codeqlArgs.push("--new-analysis-summary");
+      } else if (
+        await util.codeQlVersionAbove(this, CODEQL_VERSION_ANALYSIS_SUMMARY_V2)
+      ) {
+        codeqlArgs.push("--no-new-analysis-summary");
       }
       codeqlArgs.push(databasePath);
       if (querySuitePaths) {
         codeqlArgs.push(...querySuitePaths);
       }
-      // capture stdout, which contains analysis summaries
-      return await runTool(cmd, codeqlArgs);
+      // Capture the stdout, which contains the analysis summary. Don't stream it to the Actions
+      // logs to avoid printing it twice.
+      const analysisSummary = await runTool(cmd, codeqlArgs, {
+        noStreamStdout: true,
+      });
+
+      if (shouldWorkaroundInvalidNotifications) {
+        util.fixInvalidNotificationsInFile(codeqlOutputFile, sarifFile, logger);
+      }
+
+      return analysisSummary;
     },
     async databasePrintBaseline(databasePath: string): Promise<string> {
       const codeqlArgs = [
@@ -1086,7 +950,7 @@ async function getCodeQLForCmd(
      */
     async packDownload(
       packs: string[],
-      qlconfigFile: string | undefined
+      qlconfigFile: string | undefined,
     ): Promise<PackDownloadOutput> {
       const qlconfigArg = qlconfigFile
         ? [`--qlconfig-file=${qlconfigFile}`]
@@ -1119,13 +983,13 @@ async function getCodeQLForCmd(
         }
       } catch (e) {
         throw new Error(
-          `Attempted to download specified packs but got an error:\n${output}\n${e}`
+          `Attempted to download specified packs but got an error:\n${output}\n${e}`,
         );
       }
     },
     async databaseCleanup(
       databasePath: string,
-      cleanupLevel: string
+      cleanupLevel: string,
     ): Promise<void> {
       const codeqlArgs = [
         "database",
@@ -1139,7 +1003,7 @@ async function getCodeQLForCmd(
     async databaseBundle(
       databasePath: string,
       outputFilePath: string,
-      databaseName: string
+      databaseName: string,
     ): Promise<void> {
       const args = [
         "database",
@@ -1150,6 +1014,84 @@ async function getCodeQLForCmd(
         ...getExtraOptionsFromEnv(["database", "bundle"]),
       ];
       await new toolrunner.ToolRunner(cmd, args).exec();
+    },
+    async databaseExportDiagnostics(
+      databasePath: string,
+      sarifFile: string,
+      automationDetailsId: string | undefined,
+      tempDir: string,
+      logger: Logger,
+    ): Promise<void> {
+      const shouldWorkaroundInvalidNotifications =
+        !(await isDiagnosticsExportInvalidSarifFixed(this));
+      const codeqlOutputFile = shouldWorkaroundInvalidNotifications
+        ? path.join(tempDir, "codeql-intermediate-results.sarif")
+        : sarifFile;
+      const args = [
+        "database",
+        "export-diagnostics",
+        `${databasePath}`,
+        "--db-cluster", // Database is always a cluster for CodeQL versions that support diagnostics.
+        "--format=sarif-latest",
+        `--output=${codeqlOutputFile}`,
+        "--sarif-include-diagnostics", // ExportDiagnosticsEnabled is always true if this command is run.
+        "-vvv",
+        ...getExtraOptionsFromEnv(["diagnostics", "export"]),
+      ];
+      if (automationDetailsId !== undefined) {
+        args.push("--sarif-category", automationDetailsId);
+      }
+      await new toolrunner.ToolRunner(cmd, args).exec();
+
+      if (shouldWorkaroundInvalidNotifications) {
+        // Fix invalid notifications in the SARIF file output by CodeQL.
+        util.fixInvalidNotificationsInFile(codeqlOutputFile, sarifFile, logger);
+      }
+    },
+    async diagnosticsExport(
+      sarifFile: string,
+      automationDetailsId: string | undefined,
+      config: Config,
+    ): Promise<void> {
+      const args = [
+        "diagnostics",
+        "export",
+        "--format=sarif-latest",
+        `--output=${sarifFile}`,
+        ...(await getCodeScanningConfigExportArguments(config, this)),
+        ...getExtraOptionsFromEnv(["diagnostics", "export"]),
+      ];
+      if (automationDetailsId !== undefined) {
+        args.push("--sarif-category", automationDetailsId);
+      }
+      await new toolrunner.ToolRunner(cmd, args).exec();
+    },
+    async resolveExtractor(language: Language): Promise<string> {
+      // Request it using `format=json` so we don't need to strip the trailing new line generated by
+      // the CLI.
+      let extractorPath = "";
+      await new toolrunner.ToolRunner(
+        cmd,
+        [
+          "resolve",
+          "extractor",
+          "--format=json",
+          `--language=${language}`,
+          ...getExtraOptionsFromEnv(["resolve", "extractor"]),
+        ],
+        {
+          silent: true,
+          listeners: {
+            stdout: (data) => {
+              extractorPath += data.toString();
+            },
+            stderr: (data) => {
+              process.stderr.write(data);
+            },
+          },
+        },
+      ).exec();
+      return JSON.parse(extractorPath);
     },
   };
   // To ensure that status reports include the CodeQL CLI version wherever
@@ -1165,8 +1107,27 @@ async function getCodeQLForCmd(
     !(await util.codeQlVersionAbove(codeql, CODEQL_MINIMUM_VERSION))
   ) {
     throw new Error(
-      `Expected a CodeQL CLI with version at least ${CODEQL_MINIMUM_VERSION} but got version ${await codeql.getVersion()}`
+      `Expected a CodeQL CLI with version at least ${CODEQL_MINIMUM_VERSION} but got version ${await codeql.getVersion()}`,
     );
+  } else if (
+    checkVersion &&
+    process.env[EnvVar.SUPPRESS_DEPRECATED_SOON_WARNING] !== "true" &&
+    !(await util.codeQlVersionAbove(codeql, CODEQL_NEXT_MINIMUM_VERSION))
+  ) {
+    core.warning(
+      `CodeQL CLI version ${await codeql.getVersion()} was discontinued on ` +
+        `${GHES_MOST_RECENT_DEPRECATION_DATE} alongside GitHub Enterprise Server ` +
+        `${GHES_VERSION_MOST_RECENTLY_DEPRECATED} and will not be supported by the next minor ` +
+        `release of the CodeQL Action. Please update to CodeQL CLI version ` +
+        `${CODEQL_NEXT_MINIMUM_VERSION} or later. For instance, if you have specified a custom ` +
+        "version of the CLI using the 'tools' input to the 'init' Action, you can remove this " +
+        "input to use the default version.\n\n" +
+        "Alternatively, if you want to continue using CodeQL CLI version " +
+        `${await codeql.getVersion()}, you can replace 'github/codeql-action/*@v2' by ` +
+        `'github/codeql-action/*@v${getActionVersion()}' in your code scanning workflow to ` +
+        "continue using this version of the CodeQL Action.",
+    );
+    core.exportVariable(EnvVar.SUPPRESS_DEPRECATED_SOON_WARNING, "true");
   }
   return codeql;
 }
@@ -1190,7 +1151,7 @@ function asExtraOptions(options: any, pathInfo: string[]): string[] {
   }
   if (!Array.isArray(options)) {
     const msg = `The extra options for '${pathInfo.join(
-      "."
+      ".",
     )}' ('${JSON.stringify(options)}') are not in an array.`;
     throw new Error(msg);
   }
@@ -1198,7 +1159,7 @@ function asExtraOptions(options: any, pathInfo: string[]): string[] {
     const t = typeof o;
     if (t !== "string" && t !== "number" && t !== "boolean") {
       const msg = `The extra option for '${pathInfo.join(
-        "."
+        ".",
       )}' ('${JSON.stringify(o)}') is not a primitive value.`;
       throw new Error(msg);
     }
@@ -1217,7 +1178,7 @@ function asExtraOptions(options: any, pathInfo: string[]): string[] {
 export function getExtraOptions(
   options: any,
   paths: string[],
-  pathInfo: string[]
+  pathInfo: string[],
 ): string[] {
   const all = asExtraOptions(options?.["*"], pathInfo.concat("*"));
   const specific =
@@ -1226,7 +1187,7 @@ export function getExtraOptions(
       : getExtraOptions(
           options?.[paths[0]],
           paths?.slice(1),
-          pathInfo.concat(paths[0])
+          pathInfo.concat(paths[0]),
         );
   return all.concat(specific);
 }
@@ -1241,24 +1202,106 @@ export function getExtraOptions(
  */
 const maxErrorSize = 20_000;
 
-async function runTool(cmd: string, args: string[] = []) {
+async function runTool(
+  cmd: string,
+  args: string[] = [],
+  opts: { stdin?: string; noStreamStdout?: boolean } = {},
+) {
   let output = "";
   let error = "";
+  process.stdout.write(`[command]${cmd} ${args.join(" ")}\n`);
   const exitCode = await new toolrunner.ToolRunner(cmd, args, {
+    ignoreReturnCode: true,
     listeners: {
       stdout: (data: Buffer) => {
-        output += data.toString();
+        output += data.toString("utf8");
+        if (!opts.noStreamStdout) {
+          process.stdout.write(data);
+        }
       },
       stderr: (data: Buffer) => {
-        const toRead = Math.min(maxErrorSize - error.length, data.length);
-        error += data.toString("utf8", 0, toRead);
+        let readStartIndex = 0;
+        // If the error is too large, then we only take the last 20,000 characters
+        if (data.length - maxErrorSize > 0) {
+          // Eg: if we have 20,000 the start index should be 2.
+          readStartIndex = data.length - maxErrorSize + 1;
+        }
+        error += data.toString("utf8", readStartIndex);
+        // Mimic the standard behavior of the toolrunner by writing stderr to stdout
+        process.stdout.write(data);
       },
     },
-    ignoreReturnCode: true,
+    silent: true,
+    ...(opts.stdin ? { input: Buffer.from(opts.stdin || "") } : {}),
   }).exec();
-  if (exitCode !== 0)
+  if (exitCode !== 0) {
+    error = extractFatalErrors(error) || error;
     throw new CommandInvocationError(cmd, args, exitCode, error, output);
+  }
   return output;
+}
+
+/**
+ * Provide a better error message from the stderr of a CLI invocation that failed with a fatal
+ * error.
+ *
+ * - If the CLI invocation failed with a fatal error, this returns that fatal error, followed by
+ *   any fatal errors that occurred in plumbing commands.
+ * - If the CLI invocation did not fail with a fatal error, this returns `undefined`.
+ *
+ * ### Example
+ *
+ * ```
+ * Running TRAP import for CodeQL database at /home/runner/work/_temp/codeql_databases/javascript...
+ * A fatal error occurred: Evaluator heap must be at least 384.00 MiB
+ * A fatal error occurred: Dataset import for
+ * /home/runner/work/_temp/codeql_databases/javascript/db-javascript failed with code 2
+ * ```
+ *
+ * becomes
+ *
+ * ```
+ * Encountered a fatal error while running "codeql-for-testing database finalize --finalize-dataset
+ * --threads=2 --ram=2048 db". Exit code was 32 and error was: A fatal error occurred: Dataset
+ * import for /home/runner/work/_temp/codeql_databases/javascript/db-javascript failed with code 2.
+ * Context: A fatal error occurred: Evaluator heap must be at least 384.00 MiB.
+ * ```
+ *
+ * Where possible, this tries to summarize the error into a single line, as this displays better in
+ * the Actions UI.
+ */
+function extractFatalErrors(error: string): string | undefined {
+  const fatalErrorRegex = /.*fatal error occurred:/gi;
+  let fatalErrors: string[] = [];
+  let lastFatalErrorIndex: number | undefined;
+  let match: RegExpMatchArray | null;
+  while ((match = fatalErrorRegex.exec(error)) !== null) {
+    if (lastFatalErrorIndex !== undefined) {
+      fatalErrors.push(error.slice(lastFatalErrorIndex, match.index).trim());
+    }
+    lastFatalErrorIndex = match.index;
+  }
+  if (lastFatalErrorIndex !== undefined) {
+    const lastError = error.slice(lastFatalErrorIndex).trim();
+    if (fatalErrors.length === 0) {
+      // No other errors
+      return lastError;
+    }
+    const isOneLiner = !fatalErrors.some((e) => e.includes("\n"));
+    if (isOneLiner) {
+      fatalErrors = fatalErrors.map(ensureEndsInPeriod);
+    }
+    return [
+      ensureEndsInPeriod(lastError),
+      "Context:",
+      ...fatalErrors.reverse(),
+    ].join(isOneLiner ? " " : "\n");
+  }
+  return undefined;
+}
+
+function ensureEndsInPeriod(text: string): string {
+  return text[text.length - 1] === "." ? text : `${text}.`;
 }
 
 /**
@@ -1272,12 +1315,14 @@ async function runTool(cmd: string, args: string[] = []) {
 async function generateCodeScanningConfig(
   codeql: CodeQL,
   config: Config,
-  featureEnablement: FeatureEnablement
+  features: FeatureEnablement,
+  logger: Logger,
 ): Promise<string | undefined> {
-  if (!(await util.useCodeScanningConfigInCli(codeql, featureEnablement))) {
+  if (!(await useCodeScanningConfigInCli(codeql, features))) {
     return;
   }
-  const configLocation = path.resolve(config.tempDir, "user-config.yaml");
+  const codeScanningConfigFile = getGeneratedCodeScanningConfigPath(config);
+
   // make a copy so we can modify it
   const augmentedConfig = cloneObject(config.originalUserInput);
 
@@ -1285,7 +1330,7 @@ async function generateCodeScanningConfig(
   if (config.augmentationProperties.queriesInput) {
     if (config.augmentationProperties.queriesInputCombines) {
       augmentedConfig.queries = (augmentedConfig.queries || []).concat(
-        config.augmentationProperties.queriesInput
+        config.augmentationProperties.queriesInput,
       );
     } else {
       augmentedConfig.queries = config.augmentationProperties.queriesInput;
@@ -1301,7 +1346,7 @@ async function generateCodeScanningConfig(
       // At this point, we already know that this is a single-language analysis
       if (Array.isArray(augmentedConfig.packs)) {
         augmentedConfig.packs = (augmentedConfig.packs || []).concat(
-          config.augmentationProperties.packsInput
+          config.augmentationProperties.packsInput,
         );
       } else if (!augmentedConfig.packs) {
         augmentedConfig.packs = config.augmentationProperties.packsInput;
@@ -1334,11 +1379,100 @@ async function generateCodeScanningConfig(
       augmentedConfig.packs["javascript"].push(packString);
     }
   }
+  logger.info(
+    `Writing augmented user configuration file to ${codeScanningConfigFile}`,
+  );
+  logger.startGroup("Augmented user configuration file contents");
+  logger.info(yaml.dump(augmentedConfig));
+  logger.endGroup();
 
-  fs.writeFileSync(configLocation, yaml.dump(augmentedConfig));
-  return configLocation;
+  fs.writeFileSync(codeScanningConfigFile, yaml.dump(augmentedConfig));
+  return codeScanningConfigFile;
 }
 
-function cloneObject(obj: any) {
+function cloneObject<T>(obj: T): T {
   return JSON.parse(JSON.stringify(obj));
+}
+
+/**
+ * Gets arguments for passing the code scanning configuration file to interpretation commands like
+ * `codeql database interpret-results` and `codeql database export-diagnostics`.
+ *
+ * Returns an empty list if a code scanning configuration file was not generated by the CLI.
+ */
+async function getCodeScanningConfigExportArguments(
+  config: Config,
+  codeql: CodeQL,
+): Promise<string[]> {
+  const codeScanningConfigPath = getGeneratedCodeScanningConfigPath(config);
+  if (
+    fs.existsSync(codeScanningConfigPath) &&
+    (await util.codeQlVersionAbove(
+      codeql,
+      CODEQL_VERSION_EXPORT_CODE_SCANNING_CONFIG,
+    ))
+  ) {
+    return ["--sarif-codescanning-config", codeScanningConfigPath];
+  }
+  return [];
+}
+
+// This constant sets the size of each TRAP cache in megabytes.
+const TRAP_CACHE_SIZE_MB = 1024;
+
+export async function getTrapCachingExtractorConfigArgs(
+  config: Config,
+): Promise<string[]> {
+  const result: string[][] = [];
+  for (const language of config.languages)
+    result.push(
+      await getTrapCachingExtractorConfigArgsForLang(config, language),
+    );
+  return result.flat();
+}
+
+export async function getTrapCachingExtractorConfigArgsForLang(
+  config: Config,
+  language: Language,
+): Promise<string[]> {
+  const cacheDir = config.trapCaches[language];
+  if (cacheDir === undefined) return [];
+  const write = await isAnalyzingDefaultBranch();
+  return [
+    `-O=${language}.trap.cache.dir=${cacheDir}`,
+    `-O=${language}.trap.cache.bound=${TRAP_CACHE_SIZE_MB}`,
+    `-O=${language}.trap.cache.write=${write}`,
+  ];
+}
+
+/**
+ * Get the path to the code scanning configuration generated by the CLI.
+ *
+ * This will not exist if the configuration is being parsed in the Action.
+ */
+export function getGeneratedCodeScanningConfigPath(config: Config): string {
+  return path.resolve(config.tempDir, "user-config.yaml");
+}
+
+function isNoCodeFoundError(e: CommandInvocationError): boolean {
+  /**
+   * Earlier versions of the JavaScript extractor (pre-CodeQL 2.12.0) extract externs even if no
+   * source code was found. This means that we don't get the no code found error from
+   * `codeql database finalize`. To ensure users get a good error message, we detect this manually
+   * here, and upon detection override the error message.
+   *
+   * This can be removed once support for CodeQL 2.11.6 is removed.
+   */
+  const javascriptNoCodeFoundWarning =
+    "No JavaScript or TypeScript code found.";
+  return e.exitCode === 32 || e.error.includes(javascriptNoCodeFoundWarning);
+}
+
+async function isDiagnosticsExportInvalidSarifFixed(
+  codeql: CodeQL,
+): Promise<boolean> {
+  return await util.codeQlVersionAbove(
+    codeql,
+    CODEQL_VERSION_DIAGNOSTICS_EXPORT_FIXED,
+  );
 }

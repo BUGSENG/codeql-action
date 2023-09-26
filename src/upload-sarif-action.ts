@@ -1,50 +1,57 @@
 import * as core from "@actions/core";
 
 import * as actionsUtil from "./actions-util";
+import { getActionVersion } from "./actions-util";
 import { getActionsLogger } from "./logging";
 import { parseRepositoryNwo } from "./repository";
+import {
+  createStatusReportBase,
+  sendStatusReport,
+  StatusReportBase,
+  getActionsStatus,
+} from "./status-report";
 import * as upload_lib from "./upload-lib";
 import {
-  checkActionVersion,
+  checkDiskUsage,
   getRequiredEnvParam,
   initializeEnvironment,
   isInTestMode,
+  wrapError,
 } from "./util";
 
-// eslint-disable-next-line import/no-commonjs
-const pkg = require("../package.json");
-
 interface UploadSarifStatusReport
-  extends actionsUtil.StatusReportBase,
+  extends StatusReportBase,
     upload_lib.UploadStatusReport {}
 
 async function sendSuccessStatusReport(
   startedAt: Date,
-  uploadStats: upload_lib.UploadStatusReport
+  uploadStats: upload_lib.UploadStatusReport,
 ) {
-  const statusReportBase = await actionsUtil.createStatusReportBase(
+  const statusReportBase = await createStatusReportBase(
     "upload-sarif",
     "success",
-    startedAt
+    startedAt,
+    await checkDiskUsage(),
   );
   const statusReport: UploadSarifStatusReport = {
     ...statusReportBase,
     ...uploadStats,
   };
-  await actionsUtil.sendStatusReport(statusReport);
+  await sendStatusReport(statusReport);
 }
 
 async function run() {
   const startedAt = new Date();
-  initializeEnvironment(pkg.version);
-  await checkActionVersion(pkg.version);
+  const logger = getActionsLogger();
+  initializeEnvironment(getActionVersion());
   if (
-    !(await actionsUtil.sendStatusReport(
-      await actionsUtil.createStatusReportBase(
+    !(await sendStatusReport(
+      await createStatusReportBase(
         "upload-sarif",
         "starting",
-        startedAt
-      )
+        startedAt,
+        await checkDiskUsage(),
+      ),
     ))
   ) {
     return;
@@ -53,7 +60,10 @@ async function run() {
   try {
     const uploadResult = await upload_lib.uploadFromActions(
       actionsUtil.getRequiredInput("sarif_file"),
-      getActionsLogger()
+      actionsUtil.getRequiredInput("checkout_path"),
+      actionsUtil.getOptionalInput("category"),
+      logger,
+      { considerInvalidRequestUserError: true },
     );
     core.setOutput("sarif-id", uploadResult.sarifID);
 
@@ -64,23 +74,24 @@ async function run() {
       await upload_lib.waitForProcessing(
         parseRepositoryNwo(getRequiredEnvParam("GITHUB_REPOSITORY")),
         uploadResult.sarifID,
-        getActionsLogger()
+        logger,
       );
     }
     await sendSuccessStatusReport(startedAt, uploadResult.statusReport);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const stack = error instanceof Error ? error.stack : String(error);
+  } catch (unwrappedError) {
+    const error = wrapError(unwrappedError);
+    const message = error.message;
     core.setFailed(message);
     console.log(error);
-    await actionsUtil.sendStatusReport(
-      await actionsUtil.createStatusReportBase(
+    await sendStatusReport(
+      await createStatusReportBase(
         "upload-sarif",
-        actionsUtil.getActionsStatus(error),
+        getActionsStatus(error),
         startedAt,
+        await checkDiskUsage(),
         message,
-        stack
-      )
+        error.stack,
+      ),
     );
     return;
   }
@@ -90,8 +101,9 @@ async function runWrapper() {
   try {
     await run();
   } catch (error) {
-    core.setFailed(`codeql/upload-sarif action failed: ${error}`);
-    console.log(error);
+    core.setFailed(
+      `codeql/upload-sarif action failed: ${wrapError(error).message}`,
+    );
   }
 }
 

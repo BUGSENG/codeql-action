@@ -1,12 +1,32 @@
+import { TextDecoder } from "node:util";
+import path from "path";
+
 import * as github from "@actions/github";
 import { TestFn } from "ava";
+import nock from "nock";
 import * as sinon from "sinon";
 
 import * as apiClient from "./api-client";
+import { GitHubApiDetails } from "./api-client";
 import * as CodeQL from "./codeql";
-import { Feature, FeatureEnablement } from "./feature-flags";
+import {
+  CodeQLDefaultVersionInfo,
+  Feature,
+  FeatureEnablement,
+} from "./feature-flags";
 import { Logger } from "./logging";
 import { HTTPError } from "./util";
+
+export const SAMPLE_DOTCOM_API_DETAILS = {
+  auth: "token",
+  url: "https://github.com",
+  apiURL: "https://api.github.com",
+};
+
+export const SAMPLE_DEFAULT_CLI_VERSION: CodeQLDefaultVersionInfo = {
+  cliVersion: "2.20.0",
+  tagName: "codeql-bundle-v2.20.0",
+};
 
 type TestContext = {
   stdoutWrite: any;
@@ -23,7 +43,7 @@ function wrapOutput(context: TestContext) {
   return (
     chunk: Uint8Array | string,
     encoding?: string,
-    cb?: (err?: Error) => void
+    cb?: (err?: Error) => void,
   ): boolean => {
     // Work out which method overload we are in
     if (cb === undefined && typeof encoding === "function") {
@@ -68,7 +88,7 @@ export function setupTests(test: TestFn<any>) {
     // environment variable on Windows isn't preserved, i.e. `process.env.PATH`
     // is not the same as `process.env.Path`.
     const pathKeys = Object.keys(process.env).filter(
-      (k) => k.toLowerCase() === "path"
+      (k) => k.toLowerCase() === "path",
     );
     if (pathKeys.length > 0) {
       process.env.PATH = process.env[pathKeys[0]];
@@ -89,6 +109,9 @@ export function setupTests(test: TestFn<any>) {
     if (!t.passed) {
       process.stdout.write(t.context.testOutput);
     }
+
+    // Undo any modifications made by nock
+    nock.cleanAll();
 
     // Undo any modifications made by sinon
     sinon.restore();
@@ -138,7 +161,7 @@ export function getRecordingLogger(messages: LoggedMessage[]): Logger {
 /** Mock the HTTP request to the feature flags enablement API endpoint. */
 export function mockFeatureFlagApiEndpoint(
   responseStatusCode: number,
-  response: { [flagName: string]: boolean }
+  response: { [flagName: string]: boolean },
 ) {
   // Passing an auth token is required, so we just use a dummy value
   const client = github.getOctokit("123");
@@ -146,7 +169,7 @@ export function mockFeatureFlagApiEndpoint(
   const requestSpy = sinon.stub(client, "request");
 
   const optInSpy = requestSpy.withArgs(
-    "GET /repos/:owner/:repo/code-scanning/codeql-action/features"
+    "GET /repos/:owner/:repo/code-scanning/codeql-action/features",
   );
   if (responseStatusCode < 300) {
     optInSpy.resolves({
@@ -174,9 +197,12 @@ export function mockLanguagesInRepo(languages: string[]) {
     url: "GET /repos/:owner/:repo/languages",
   });
 
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
   mockClient.returns({
-    repos: {
-      listLanguages,
+    rest: {
+      repos: {
+        listLanguages,
+      },
     },
   } as any);
   return listLanguages;
@@ -197,8 +223,57 @@ export function mockCodeQLVersion(version) {
  */
 export function createFeatures(enabledFeatures: Feature[]): FeatureEnablement {
   return {
+    getDefaultCliVersion: async () => {
+      throw new Error("not implemented");
+    },
     getValue: async (feature) => {
       return enabledFeatures.includes(feature);
     },
   };
+}
+
+/**
+ * Mocks the API for downloading the bundle tagged `tagName`.
+ *
+ * @returns the download URL for the bundle. This can be passed to the tools parameter of
+ * `codeql.setupCodeQL`.
+ */
+export function mockBundleDownloadApi({
+  apiDetails = SAMPLE_DOTCOM_API_DETAILS,
+  isPinned,
+  repo = "github/codeql-action",
+  platformSpecific = true,
+  tagName,
+}: {
+  apiDetails?: GitHubApiDetails;
+  isPinned?: boolean;
+  repo?: string;
+  platformSpecific?: boolean;
+  tagName: string;
+}): string {
+  const platform =
+    process.platform === "win32"
+      ? "win64"
+      : process.platform === "linux"
+      ? "linux64"
+      : "osx64";
+
+  const baseUrl = apiDetails?.url ?? "https://example.com";
+  const relativeUrl = apiDetails
+    ? `/${repo}/releases/download/${tagName}/codeql-bundle${
+        platformSpecific ? `-${platform}` : ""
+      }.tar.gz`
+    : `/download/${tagName}/codeql-bundle.tar.gz`;
+
+  nock(baseUrl)
+    .get(relativeUrl)
+    .replyWithFile(
+      200,
+      path.join(
+        __dirname,
+        `/../src/testdata/codeql-bundle${isPinned ? "-pinned" : ""}.tar.gz`,
+      ),
+    );
+
+  return `${baseUrl}${relativeUrl}`;
 }

@@ -1,17 +1,17 @@
 # Warning: This file is generated automatically, and should not be modified.
 # Instead, please modify the template in the pr-checks directory and run:
-#     pip install ruamel.yaml && python3 sync.py
+#     (cd pr-checks; pip install ruamel.yaml@0.17.31 && python3 sync.py)
 # to regenerate this file.
 
 name: 'PR Check - Packaging: Config and input'
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
+  CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN: 'true'
 on:
   push:
     branches:
     - main
-    - releases/v1
     - releases/v2
   pull_request:
     types:
@@ -32,11 +32,11 @@ jobs:
         - os: windows-latest
           version: latest
         - os: ubuntu-latest
-          version: cached
+          version: default
         - os: macos-latest
-          version: cached
+          version: default
         - os: windows-latest
-          version: cached
+          version: default
         - os: ubuntu-latest
           version: nightly-latest
         - os: macos-latest
@@ -44,20 +44,32 @@ jobs:
         - os: windows-latest
           version: nightly-latest
     name: 'Packaging: Config and input'
+    permissions:
+      contents: read
+      security-events: write
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
     - name: Check out repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     - name: Prepare test
       id: prepare-test
-      uses: ./.github/prepare-test
+      uses: ./.github/actions/prepare-test
       with:
         version: ${{ matrix.version }}
+        use-all-platform-bundle: 'false'
+    - name: Set environment variable for Swift enablement
+      if: >-
+        runner.os != 'Windows' && (
+            matrix.version == '20220908' ||
+            matrix.version == '20221211'
+        )
+      shell: bash
+      run: echo "CODEQL_ENABLE_EXPERIMENTAL_FEATURES_SWIFT=true" >> $GITHUB_ENV
     - uses: ./../action/init
       with:
         config-file: .github/codeql/codeql-config-packaging3.yml
-        packs: +dsp-testing/codeql-pack1@1.0.0
+        packs: +codeql-testing/codeql-pack1@1.0.0
         languages: javascript
         tools: ${{ steps.prepare-test.outputs.tools-url }}
     - name: Build code
@@ -66,12 +78,14 @@ jobs:
     - uses: ./../action/analyze
       with:
         output: ${{ runner.temp }}/results
+        upload-database: false
 
     - name: Check results
-      uses: ./../action/.github/check-sarif
+      uses: ./../action/.github/actions/check-sarif
       with:
         sarif-file: ${{ runner.temp }}/results/javascript.sarif
-        queries-run: javascript/example/empty-or-one-block,javascript/example/empty-or-one-block,javascript/example/other-query-block,javascript/example/two-block
+        queries-run: 
+          javascript/example/empty-or-one-block,javascript/example/empty-or-one-block,javascript/example/other-query-block,javascript/example/two-block
         queries-not-run: foo,bar
 
     - name: Assert Results
